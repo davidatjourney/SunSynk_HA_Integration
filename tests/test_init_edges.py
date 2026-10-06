@@ -95,8 +95,9 @@ async def test_service_handlers_reject_missing_scheduler():
     hass = MagicMock()
     hass.data = {DOMAIN: {}}
     hass.http.async_register_static_paths = AsyncMock()
+    hass.async_run_hass_job.side_effect = lambda job, call: job.target(call)
     hass.services.async_register.side_effect = (
-        lambda domain, service, handler, schema: handlers.__setitem__(service, handler)
+        lambda domain, service, handler, schema, *args, **kwargs: handlers.__setitem__(service, handler)
     )
     await integration.async_setup(hass, {})
     coordinator = MagicMock(spec=integration.SunsynkCoordinator)
@@ -121,7 +122,7 @@ async def test_service_handlers_reject_missing_scheduler():
         (integration.SERVICE_CLEAR_VIRTUAL_SLOT, {"serial": "SN1", "slot_id": 1}),
     ):
         with pytest.raises(ValueError, match="not initialised"):
-            await handlers[service](SimpleNamespace(data=data))
+            await handlers[service](SimpleNamespace(data=data, context=SimpleNamespace(user_id=None)))
 
 
 @pytest.mark.asyncio
@@ -299,3 +300,26 @@ async def test_update_listener_reloads_entry(mock_hass):
         mock_hass, MagicMock(entry_id="entry")
     )
     mock_hass.config_entries.async_reload.assert_awaited_once_with("entry")
+
+
+@pytest.mark.asyncio
+async def test_readonly_dashboard_finds_local_schedule_without_write_topology():
+    from homeassistant.helpers.update_coordinator import UpdateFailed
+
+    dashboard = MagicMock(async_save=AsyncMock())
+    hass, entry, coordinator, registry = _dashboard_context({"sunsynk-abcdef12": dashboard})
+    coordinator.resolve_write_target.side_effect = UpdateFailed("No write profile")
+    registry.entities["switch.schedule"] = SimpleNamespace(
+        platform=DOMAIN, unique_id="SN1_vslots_enabled", entity_id="switch.schedule"
+    )
+
+    def build(_prefix, _eid, _forecast, _tariff, _entry_id, vslot_eid):
+        assert vslot_eid("enabled") == "switch.schedule"
+        return {}
+
+    with (
+        patch("custom_components.sunsynk.er.async_get", return_value=registry),
+        patch("custom_components.sunsynk.build_dashboard", side_effect=build),
+    ):
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+    dashboard.async_save.assert_awaited_once()

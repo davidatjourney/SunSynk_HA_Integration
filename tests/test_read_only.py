@@ -348,8 +348,9 @@ async def test_manual_services_reject_without_post(mock_hass):
     coordinator = _coordinator()
     mock_hass.data = _mode_context(coordinator).data
     handlers = {}
+    mock_hass.async_run_hass_job.side_effect = lambda job, call: job.target(call)
     mock_hass.services.async_register.side_effect = (
-        lambda domain, service, handler, schema: handlers.setdefault(service, handler)
+        lambda domain, service, handler, schema, *args, **kwargs: handlers.setdefault(service, handler)
     )
     mock_hass.http.async_register_static_paths = AsyncMock()
     await async_setup(mock_hass, {})
@@ -360,7 +361,7 @@ async def test_manual_services_reject_without_post(mock_hass):
     ]:
         with pytest.raises(SunsynkReadOnlyError):
             await handlers[service](
-                SimpleNamespace(data={"serial": "TEST123", **fields})
+                SimpleNamespace(data={"serial": "TEST123", **fields}, context=SimpleNamespace(user_id=None))
             )
     coordinator._async_get_session.assert_not_awaited()
 

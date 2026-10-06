@@ -25,9 +25,9 @@ This register records audit findings and remediation progress. The behaviour des
 - [x] R02: require declared group membership, a verified master, matching plant/roles, known capabilities, and fresh topology before writes. Missing or failed topology blocks writes.
 - [x] R03: send minimal battery/system payloads, read timer companions fresh, validate every transmitted field, reject detected concurrent changes, and verify affected sibling settings.
 - [x] R04: enforce explicit current/power/export/reserve limits, hardware power caps, SOC relationships and timer ordering; remove automatic 30 kW and SOC fallback values.
-- [x] Add regression coverage and document configuration in README and CHANGELOG. The full mocked Home Assistant suite passes: 574 tests, 100% statement coverage; production Ruff checks pass.
+- [x] Add regression coverage and document configuration in README and CHANGELOG. The full mocked Home Assistant suite passes: 605 tests, 100% statement coverage; production Ruff checks pass.
 - [ ] Validate R02–R04 with a real/test inverter and the actual installation limits, firmware and cloud payload semantics before closing these findings.
-- [ ] R01: enforce custom-service caller authorization. Read-only mode reduces exposure while enabled but does not supply caller permission checks in read/write mode.
+- [x] R01: register all five custom services through Home Assistant's existing administrator-service helper. Unknown and non-admin user contexts are rejected before routing or state changes, including slave serials; administrator and system-automation calls remain supported.
 - [ ] R05: persist original settings and uncertain operation/recovery state across restart. Runtime ownership is now recorded before writes and retained after failed restoration, but durable recovery remains open.
 - [ ] R06–R17: complete the remaining findings and their verification cases below. R08 now stops later groups after failure and reports possible partial application; compensating recovery remains open.
 
@@ -39,7 +39,7 @@ Status distinguishes implemented safeguards from physical validation. **Implemen
 
 | ID | Severity | Finding | Status |
 | --- | --- | --- | --- |
-| R01 | High | Custom services omit caller permission checks | Open |
+| R01 | High | Custom services omit caller permission checks | Closed; administrator checks tested |
 | R02 | High | Master/slave routing fails open with missing topology | Implemented; hardware validation pending |
 | R03 | High | Group writes resend stale and unvalidated sibling settings | Implemented; hardware validation pending |
 | R04 | High | Bounds do not enforce installation-specific safety limits | Implemented; hardware validation pending |
@@ -66,6 +66,8 @@ Status distinguishes implemented safeguards from physical validation. **Implemen
 **Remediation:** check caller authorization against the resolved physical target before changing settings or schedules. Decide which sensitive actions require administrator access.
 
 **Verification before closure:** a user without inverter control permission cannot invoke any of these services; authorized users and intended system automations still work; requesting the slave does not bypass authorization for the master.
+
+**Closure evidence (2026-10-06):** all five services now require administrator access through `async_register_admin_service`. Thirty regression cases exercise the real HA service registry with mocked cloud/device interfaces: unknown and non-admin users on both master and slave are rejected, while administrators and system automations are allowed. Existing routing and read-only tests remain passing. See `tests/test_services.py`; the fixing commit is recorded by `git log -- custom_components/sunsynk/__init__.py`. This closes the custom-service authorization finding; it does not close the separate operational-safety findings.
 
 ### R02 — High: master/slave routing fails open with missing topology
 

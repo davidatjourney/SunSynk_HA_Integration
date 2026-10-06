@@ -11,6 +11,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Require administrator access for all five custom control/schedule services using Home Assistant's existing permission helper; keep system automations supported and prevent slave serials from bypassing the check.
+- Keep optional dashboard schedule entities available in read-only setups without a write profile.
 - Require explicit master/member write profiles and live topology checks; missing metadata, role changes, cross-plant groups and unknown ratings block writes instead of falling back to a slave or guessed master.
 - Read settings fresh before writes, reject detectable external-edit conflicts, and send minimal battery/system payloads. Preserve required timer companions with validation of every transmitted value and read-back of unchanged sibling fields.
 - Enforce approved battery-current, power, export and SOC limits in the existing write pipeline, including restoration. Validate complete timer ordering and remove automatic 30 kW and unknown-SOC fallbacks.

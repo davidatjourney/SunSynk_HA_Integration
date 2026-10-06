@@ -37,6 +37,7 @@ def test_dashboard_is_opt_in_and_options_override_entry_data():
     )
     assert not _dashboard_enabled(
         SimpleNamespace(
+            context=SimpleNamespace(user_id=None),
             data={"create_dashboard": True},
             options={"create_dashboard": False},
         )
@@ -72,23 +73,25 @@ async def test_registered_services_route_and_execute_on_minimal_ha():
         }
     }
     hass.http.async_register_static_paths = AsyncMock()
+    hass.async_run_hass_job.side_effect = lambda job, call: job.target(call)
     hass.services.async_register.side_effect = (
-        lambda domain, service, handler, schema: handlers.setdefault(service, handler)
+        lambda domain, service, handler, schema, *args, **kwargs: handlers.setdefault(service, handler)
     )
 
     await async_setup(hass, {})
 
     await handlers["force_charge"](
-        SimpleNamespace(data={"serial": "SLAVE1", "current": 20})
+        SimpleNamespace(data={"serial": "SLAVE1", "current": 20}, context=SimpleNamespace(user_id=None))
     )
     await handlers["force_discharge"](
-        SimpleNamespace(data={"serial": "INV2", "current": 30})
+        SimpleNamespace(data={"serial": "INV2", "current": 30}, context=SimpleNamespace(user_id=None))
     )
     await handlers["set_work_mode"](
-        SimpleNamespace(data={"serial": "INV2", "mode": 4})
+        SimpleNamespace(data={"serial": "INV2", "mode": 4}, context=SimpleNamespace(user_id=None))
     )
     await handlers["set_virtual_slot"](
         SimpleNamespace(
+            context=SimpleNamespace(user_id=None),
             data={
                 "serial": "SLAVE1",
                 "slot_id": 1,
@@ -105,7 +108,7 @@ async def test_registered_services_route_and_execute_on_minimal_ha():
         )
     )
     await handlers["clear_virtual_slot"](
-        SimpleNamespace(data={"serial": "SLAVE1", "slot_id": 1})
+        SimpleNamespace(data={"serial": "SLAVE1", "slot_id": 1}, context=SimpleNamespace(user_id=None))
     )
 
     coordinator.async_write_setting.assert_any_await(
@@ -121,7 +124,7 @@ async def test_registered_services_route_and_execute_on_minimal_ha():
     for service in ("force_charge", "force_discharge", "set_work_mode", "set_virtual_slot", "clear_virtual_slot"):
         with pytest.raises(ValueError, match="No Sunsynk inverter"):
             data = {"serial": "UNKNOWN", "current": 1, "mode": 1, "slot_id": 1}
-            await handlers[service](SimpleNamespace(data=data))
+            await handlers[service](SimpleNamespace(data=data, context=SimpleNamespace(user_id=None)))
 
 
 def test_virtual_slot_service_routes_parallel_slave_to_master_scheduler():
@@ -256,3 +259,65 @@ async def test_failed_platform_unload_restarts_listeners_without_restoring():
     tariff.async_shutdown.assert_not_awaited()
     scheduler.async_shutdown.assert_not_awaited()
     coordinator.async_close.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("service", ["force_charge", "force_discharge", "set_work_mode", "set_virtual_slot", "clear_virtual_slot"])
+@pytest.mark.parametrize("serial", ["MASTER1", "SLAVE1"])
+@pytest.mark.parametrize("user", [None, SimpleNamespace(is_admin=False)])
+async def test_control_services_reject_unknown_and_non_admin_users(hass, service, serial, user):
+    """Permission checks run before routing or changing local/device state."""
+    from homeassistant.core import Context
+    from homeassistant.exceptions import Unauthorized
+
+    coordinator = _coordinator()
+    coordinator.async_write_setting = AsyncMock()
+    scheduler = MagicMock(async_set_slot=AsyncMock(), async_clear_slot=AsyncMock())
+    hass.data[DOMAIN] = {"entry": coordinator, "entry_vslots": {"MASTER1": scheduler}}
+    with patch.object(hass, "http", MagicMock(async_register_static_paths=AsyncMock())):
+        await async_setup(hass, {})
+    data = _service_data(service, serial)
+    with patch.object(hass.auth, "async_get_user", new=AsyncMock(return_value=user)):
+        with pytest.raises(Unauthorized):
+            await hass.services.async_call(DOMAIN, service, data, blocking=True, context=Context(user_id="restricted"))
+    coordinator.async_write_setting.assert_not_awaited()
+    scheduler.async_set_slot.assert_not_awaited()
+    scheduler.async_clear_slot.assert_not_awaited()
+
+
+def _service_data(service, serial):
+    """Valid service data so schema rejection cannot mask authorization errors."""
+    if service in ("force_charge", "force_discharge"):
+        return {"serial": serial, "current": 20}
+    if service == "set_work_mode":
+        return {"serial": serial, "mode": 2}
+    if service == "clear_virtual_slot":
+        return {"serial": serial, "slot_id": 1}
+    return {"serial": serial, "slot_id": 1, "start": "10:00", "end": "11:00", "mode": "charge", "current": 20}
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("service", ["force_charge", "force_discharge", "set_work_mode", "set_virtual_slot", "clear_virtual_slot"])
+@pytest.mark.parametrize("user_id", [None, "administrator"])
+async def test_control_services_allow_admin_and_system_automations(hass, service, user_id):
+    """Allowed callers retain slave-to-master routing and local schedule editing."""
+    from homeassistant.core import Context
+
+    coordinator = _coordinator()
+    coordinator.async_write_setting = AsyncMock()
+    scheduler = MagicMock(async_set_slot=AsyncMock(), async_clear_slot=AsyncMock())
+    hass.data[DOMAIN] = {"entry": coordinator, "entry_vslots": {"MASTER1": scheduler}}
+    with patch.object(hass, "http", MagicMock(async_register_static_paths=AsyncMock())):
+        await async_setup(hass, {})
+    with patch.object(hass.auth, "async_get_user", new=AsyncMock(return_value=SimpleNamespace(is_admin=True))) as lookup:
+        await hass.services.async_call(DOMAIN, service, _service_data(service, "SLAVE1"), blocking=True, context=Context(user_id=user_id))
+    if user_id is None:
+        lookup.assert_not_awaited()
+    else:
+        lookup.assert_awaited_once_with(user_id)
+    if service == "set_virtual_slot":
+        scheduler.async_set_slot.assert_awaited_once()
+    elif service == "clear_virtual_slot":
+        scheduler.async_clear_slot.assert_awaited_once_with(1)
+    else:
+        assert coordinator.async_write_setting.await_args.args[0] == "MASTER1"

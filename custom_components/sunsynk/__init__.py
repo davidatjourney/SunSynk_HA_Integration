@@ -15,7 +15,9 @@ from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME, Platform
 from homeassistant.core import HomeAssistant, ServiceCall
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.service import async_register_admin_service
 from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .api.auth import SunsynkAuth
 from .calibration import PerformanceRatioCalibrator
@@ -354,31 +356,38 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
             raise ValueError("Virtual slot scheduler not initialised for this inverter")
         await scheduler.async_clear_slot(call.data["slot_id"])
 
-    hass.services.async_register(
+    # Settings and schedules can control the physical installation. Use HA's
+    # shared administrator check; calls from system automations remain allowed.
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_FORCE_CHARGE,
         _handle_force_charge,
         _SERVICE_SERIAL_CURRENT_SCHEMA,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_FORCE_DISCHARGE,
         _handle_force_discharge,
         _SERVICE_SERIAL_CURRENT_SCHEMA,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_SET_WORK_MODE,
         _handle_set_work_mode,
         _SERVICE_SET_WORK_MODE_SCHEMA,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_SET_VIRTUAL_SLOT,
         _handle_set_virtual_slot,
         _SERVICE_SET_VIRTUAL_SLOT_SCHEMA,
     )
-    hass.services.async_register(
+    async_register_admin_service(
+        hass,
         DOMAIN,
         SERVICE_CLEAR_VIRTUAL_SLOT,
         _handle_clear_virtual_slot,
@@ -678,9 +687,13 @@ async def _async_setup_dashboard(
     }
     tariff_eid_fn = (lambda key: tariff_uid_map.get(key)) if tariff_uid_map else None
 
-    first_target = (
-        coordinator.resolve_write_target(first_serial) if first_serial else ""
-    )
+    try:
+        first_target = (
+            coordinator.resolve_write_target(first_serial) if first_serial else ""
+        )
+    except UpdateFailed:
+        # Disabled local schedule entities exist even without a write profile.
+        first_target = first_serial
     vslot_prefix = f"{first_target}_vslots_"
     vslot_uid_map: dict[str, str] = {
         e.unique_id[len(vslot_prefix) :]: e.entity_id

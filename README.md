@@ -354,7 +354,7 @@ To view current issues: **Settings → System → Repairs**.
 
 ## HA Services / Actions
 
-Five services are available for use in automations and scripts (**Developer Tools → Actions → sunsynk**):
+Five services are available for use in automations and scripts (**Developer Tools → Actions → sunsynk**). These services require a Home Assistant administrator when called with a user context. System automations without a user context remain allowed; scripts and automations carrying a non-admin user context are rejected. This applies to virtual schedule editing as well as device control. Inverter writes also require Read/write mode and a verified installation profile:
 
 | Service | Description |
 |---|---|
