@@ -12,6 +12,8 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Fixed
 
+- Initialize the bundled Power Flow Card registry when the frontend has not created it yet, preventing the browser’s undefined `push` error. Refresh the resource URL so clients fetch the patched bundle.
+
 - Create an opt-in solar dashboard for every configured inverter instead of only the first serial. Each dashboard resolves its own sensor and schedule entities and includes its own Charts view; retain the existing first-inverter dashboard URL.
 - Require administrator access for all five custom control/schedule services using Home Assistant's existing permission helper; keep system automations supported and prevent slave serials from bypassing the check.
 - Keep optional dashboard schedule entities available in read-only setups without a write profile.
