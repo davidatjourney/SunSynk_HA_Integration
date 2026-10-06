@@ -10,6 +10,8 @@ from typing import Any
 
 import aiohttp
 
+from ..write_policy import WritePolicy
+
 _LOGGER = logging.getLogger(__name__)
 
 
@@ -65,9 +67,12 @@ def _api_error(message: str, url: str) -> SunsynkApiError:
 class SunsynkClient:
     """Async client for the Sunsynk cloud API."""
 
-    def __init__(self, api_server: str, token: str) -> None:
+    def __init__(
+        self, api_server: str, token: str, *, write_policy: WritePolicy | None = None
+    ) -> None:
         self._base = f"https://{api_server}"
         self._token = token
+        self._write_policy = write_policy or WritePolicy()
 
     def _headers(self) -> dict[str, str]:
         return {
@@ -107,6 +112,8 @@ class SunsynkClient:
         payload: dict,
         params: dict | None = None,
     ) -> dict[str, Any]:
+        # Both settings endpoints pass here; token requests use the auth client.
+        self._write_policy.ensure_writable()
         try:
             async with session.post(
                 url,

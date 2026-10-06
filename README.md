@@ -589,3 +589,86 @@ Rewritten as a native Home Assistant integration with async support, proper enti
 GNU General Public License v3.0
 
 See [LICENSE](custom_components/sunsynk/LICENSE) for full text.
+
+### Read-only testing
+
+New and existing installations default to **Read-only** when no access mode is
+saved. Authentication, polling, forecasting and local virtual-schedule editing
+continue, but inverter settings and plant prices cannot be changed by this
+integration. Blocked actions report an error rather than success.
+
+Select **Read/write** in **Settings → Devices & Services → Sunsynk → Configure**
+to enable writes. Tariff Manager and Virtual Slot Scheduler still need to be
+explicitly enabled. Before selecting Read-only again, disable both controllers
+and wait for restoration and pending writes to finish. Retry failed restoration
+before changing mode. The integration will not perform restoration writes after
+read-only is selected.
+
+Read-only does not undo settings already active on your inverters or prevent
+changes from other apps. Recovery tracking is currently in memory and does not
+provide recovery after a crash. Test against a Home Assistant instance and a test
+inverter before relying on write-enabled control.
+
+### Write profiles and installation limits
+
+**Read/write** requires a write profile for every configured inverter. Configure
+profiles under **Settings → Devices & Services → Sunsynk → Configure**. The JSON
+object is keyed by the physical master serial; each profile lists all members of
+that parallel group. A standalone inverter lists only itself. Groups must not
+share members, and every member must appear in the integration's serial list.
+
+This example illustrates the format. Replace the serials, both register scopes
+and every numeric limit with values confirmed for your installation:
+
+```json
+{
+  "MASTER_SERIAL": {
+    "members": ["MASTER_SERIAL", "SLAVE_SERIAL"],
+    "current_scope": "per_inverter",
+    "power_scope": "per_inverter",
+    "max_charge_current_a": 50,
+    "max_discharge_current_a": 50,
+    "max_power_w": 8000,
+    "max_export_power_w": 0,
+    "min_soc_percent": 20
+  }
+}
+```
+
+- `current_scope` and `power_scope` each accept `per_inverter` or `group`. Confirm
+  how the cloud registers apply to your firmware; the integration does not infer
+  these scopes or multiply battery-current limits by the number of inverters.
+- Current limits must respect your battery/BMS and inverter installation. The
+  device's configured battery maximum is an additional limit.
+- Power is capped by your approved limit and fresh inverter ratings. Group-scoped
+  power uses the sum of member ratings; per-inverter power uses the master's
+  rating. Export additionally respects `max_export_power_w`, including zero.
+- Enabled timer SOC targets must respect your reserve and the known battery low
+  threshold. Shutdown/restart/low SOC relationships and the complete six-slot
+  circular time order are checked before writing.
+- Some timer slots contain a voltage companion field. To resend it, the profile
+  also needs `battery_voltage_min_v` and `battery_voltage_max_v`, both taken from
+  your approved battery configuration. Missing bounds or an out-of-range value
+  block the write. The integration does not expose voltage editing through this
+  profile.
+
+Missing topology, unknown rated power, role changes, incomplete groups and plant
+mismatches block writes. Each member is read again before dispatch; selecting a
+slave routes to its declared master. Different groups in the same plant remain
+separate. There is no fallback to a slave or guessed master.
+
+Battery and system-mode writes send only requested fields. Timer writes retain
+required same-slot companions, read them fresh and validate every transmitted
+value. Detectable external edits during preparation cause a conflict error.
+Read-back checks requested changes and unchanged fields in the affected group.
+A failed group stops later groups; earlier groups may already have applied.
+
+Disable controllers and finish restoration/pending writes before changing
+profiles. Local schedules remain editable in read-only mode without profiles,
+but cannot be enabled until write access and verified profiles are available.
+There is no 30 kW fallback for unknown capabilities.
+
+The cloud API provides no compare-and-swap transaction, so an external edit after
+the last read can still race a write. Parallel propagation, delayed reversion and
+firmware handling of minimal battery/system payloads require validation on your
+Home Assistant instance and a test inverter before unattended control.

@@ -11,12 +11,13 @@ from custom_components.sunsynk.api.client import (
     SunsynkClient,
     _is_success,
 )
+from custom_components.sunsynk.write_policy import WritePolicy
 from tests.conftest import FakeResponse, fake_session
 
 
 @pytest.fixture
 def client() -> SunsynkClient:
-    return SunsynkClient("api.sunsynk.net", "test-token")
+    return SunsynkClient("api.sunsynk.net", "test-token", write_policy=WritePolicy("read_write"))
 
 
 class TestIsSuccess:

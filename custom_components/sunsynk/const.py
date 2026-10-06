@@ -24,6 +24,11 @@ from homeassistant.helpers.entity import EntityCategory
 
 DOMAIN: Final = "sunsynk"
 
+CONF_WRITE_PROFILES: Final = "write_profiles"
+CONF_ACCESS_MODE: Final = "access_mode"
+ACCESS_READ_ONLY: Final = "read_only"
+ACCESS_READ_WRITE: Final = "read_write"
+
 CONF_API_SERVER: Final = "api_server"
 CONF_SERIALS: Final = "serials"
 CONF_REFRESH_INTERVAL: Final = "refresh_interval"

@@ -12,6 +12,8 @@ from custom_components.sunsynk.api.client import (
     SunsynkAuthenticationError,
 )
 from custom_components.sunsynk.coordinator import SunsynkCoordinator
+from custom_components.sunsynk.write_policy import WritePolicy
+from tests.conftest import inverter_info, write_profile
 
 
 def _bare(**updates):
@@ -19,10 +21,12 @@ def _bare(**updates):
     auth.async_get_token = AsyncMock(return_value="token")
     obj = SimpleNamespace(
         hass=MagicMock(),
+        write_policy=WritePolicy("read_write"),
+        write_profiles={"SN1": write_profile("SN1")},
         _auth=auth,
         _entry_id="entry",
         serials=["SN1"],
-        data={"SN1": {"settings": {}, "plant": {}}},
+        data={"SN1": {"inverter": inverter_info("SN1"), "settings": {}, "plant": {}}},
         _async_get_session=AsyncMock(return_value=MagicMock()),
         async_request_refresh=AsyncMock(),
     )
@@ -104,14 +108,14 @@ async def test_empty_setting_batch_is_noop():
     [
         (SunsynkAuthError("bad"), None, "Authentication failed"),
         (None, SunsynkAuthenticationError("401"), "Authentication failed"),
-        (None, SunsynkApiError("offline"), "Cannot read settings"),
+        (None, SunsynkApiError("offline"), "Write preflight failed"),
     ],
 )
 async def test_execute_batch_read_failures(token_error, settings_error, expected):
     obj = _bare()
     if token_error:
         obj._auth.async_get_token.side_effect = token_error
-    client = MagicMock(async_get_settings=AsyncMock(side_effect=settings_error))
+    client = MagicMock(async_get_inverter_info=AsyncMock(return_value=inverter_info("SN1")), async_get_settings=AsyncMock(side_effect=settings_error))
     with patch("custom_components.sunsynk.coordinator.SunsynkClient", return_value=client):
         failures = await SunsynkCoordinator._async_execute_setting_batch(
             obj, "SN1", {"time1on": 1}
@@ -226,7 +230,7 @@ async def test_close_waits_for_active_write_tasks():
         ("token", SunsynkAuthError("bad"), "Authentication failed"),
         ("inverter", SunsynkAuthenticationError("401"), "Authentication failed"),
         ("inverter", SunsynkApiError("offline"), "Cannot read inverter info"),
-        ("no_plant", None, "No plant found"),
+        ("no_plant", None, "Unverified write topology"),
         ("plant", SunsynkAuthenticationError("401"), "Authentication failed"),
         ("plant", SunsynkApiError("offline"), "Cannot read plant info"),
         ("write", SunsynkAuthenticationError("401"), "Authentication failed"),
@@ -244,7 +248,7 @@ async def test_plant_price_api_failures(stage, error, match):
         "charges": [{"type": 1, "price": 0.2}],
     }
     client = MagicMock(
-        async_get_inverter_info=AsyncMock(return_value={"plant": {"id": 7}}),
+        async_get_inverter_info=AsyncMock(return_value=inverter_info("SN1")),
         async_get_plant_info=AsyncMock(return_value=valid_plant),
         async_set_plant_income=AsyncMock(),
     )

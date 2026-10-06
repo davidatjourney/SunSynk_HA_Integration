@@ -99,6 +99,7 @@ class TariffChargingManager:
         self._end_hour = end_hour
         self._price_max_age_minutes = price_max_age_minutes
 
+        self._restore_task: Any = None
         self._enabled = False  # user must explicitly enable via switch
         # Runtime decisions are per physical write target.  A config entry may
         # contain several independent inverters (with parallel slaves already
@@ -173,12 +174,28 @@ class TariffChargingManager:
 
     # ── Enable / disable ───────────────────────────────────────────────────
 
+    @property
+    def restoration_pending(self) -> bool:
+        """Ownership and evaluation must settle before read-only is selected."""
+        return bool(
+            self._charging_active_serials
+            or self._discharging_active_serials
+            or self._evaluate_lock.locked()
+            or (self._restore_task is not None and not self._restore_task.done())
+        )
+
     def set_enabled(self, enabled: bool) -> None:
         """Enable or disable without losing configuration."""
+        if enabled:
+            self._coordinator.write_policy.ensure_writable()
+            for serial in self._coordinator.serials:
+                self._coordinator.resolve_write_target(serial)
         self._enabled = enabled
         if not enabled:
             if self._charging_active_serials or self._discharging_active_serials:
-                self._hass.async_create_task(self._async_restore_active_currents())
+                self._restore_task = self._hass.async_create_task(
+                    self._async_restore_active_currents()
+                )
             _LOGGER.info("Tariff manager disabled — restoring normal currents")
             self._send_notification(
                 "Tariff Manager disabled",
@@ -205,6 +222,14 @@ class TariffChargingManager:
                     and self._normal_discharge_current is not None
                 ):
                     restores["dischargeCurrent"] = self._normal_discharge_current
+                if (
+                    serial in charge_serials and self._normal_charge_current is None
+                ) or (
+                    serial in discharge_serials
+                    and self._normal_discharge_current is None
+                ):
+                    success = False
+                    continue
                 if restores:
                     try:
                         await self._coordinator.async_write_settings(serial, restores)
@@ -215,9 +240,9 @@ class TariffChargingManager:
                             serial,
                             err,
                         )
-
-            self._charging_active_serials.clear()
-            self._discharging_active_serials.clear()
+                        continue
+                self._charging_active_serials.discard(serial)
+                self._discharging_active_serials.discard(serial)
 
         self._notify_listeners()
         return success
@@ -339,6 +364,7 @@ class TariffChargingManager:
         """
         if not self._enabled:
             return
+        self._coordinator.write_policy.ensure_writable()
 
         import_quality, import_detail = self._compute_price_quality(self._price_entity)
         if import_quality != self._price_quality:
@@ -445,10 +471,10 @@ class TariffChargingManager:
                 soc,
                 self._target_soc,
             )
+            self._charging_active_serials.add(serial)
             await self._coordinator.async_write_setting(
                 serial, "chargeCurrent", self._cheap_current
             )
-            self._charging_active_serials.add(serial)
             self._send_notification(
                 "Tariff: Charging started",
                 f"Inverter {serial}: price {price:.4f} ≤ threshold {self._cheap_threshold}. "
@@ -490,10 +516,10 @@ class TariffChargingManager:
                 soc,
                 self._discharge_min_soc,
             )
+            self._discharging_active_serials.add(serial)
             await self._coordinator.async_write_setting(
                 serial, "dischargeCurrent", self._peak_discharge_current
             )
-            self._discharging_active_serials.add(serial)
             self._send_notification(
                 "Tariff: Discharging started",
                 f"Inverter {serial}: price {price:.4f} ≥ threshold {self._expensive_threshold}. "

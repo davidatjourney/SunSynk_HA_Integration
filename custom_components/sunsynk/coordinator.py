@@ -25,11 +25,14 @@ from .const import (
     SOLAR_FORECAST_UPDATE_INTERVAL,
     SYSTEM_MODE_SETTING_KEYS,
 )
+from .write_policy import WritePolicy
 from .write_validation import (
-    WRITABLE_SETTING_KEYS,
     SunsynkSettingValidationError,
+    WriteProfile,
+    validate_installation_settings,
     validate_plant_price,
     validate_setting_batch,
+    validate_setting_payload,
     validate_setting_value,
 )
 
@@ -54,6 +57,9 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         serials: list[str],
         refresh_interval: int,
         entry_id: str = "",
+        *,
+        write_policy: WritePolicy | None = None,
+        write_profiles: dict[str, WriteProfile] | None = None,
     ) -> None:
         super().__init__(
             hass,
@@ -64,6 +70,8 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._auth = auth
         self.serials = serials
         self._entry_id = entry_id
+        self.write_policy = write_policy or WritePolicy()
+        self.write_profiles = write_profiles or {}
         self._session: aiohttp.ClientSession | None = None
         self._write_locks: dict[str, asyncio.Lock] = {}
         self._pending_setting_writes: dict[str, dict[str, Any]] = {}
@@ -73,6 +81,16 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self._write_drain_scheduled: set[str] = set()
         self._write_drain_tasks: dict[str, asyncio.Task[None]] = {}
 
+    @property
+    def writes_pending(self) -> bool:
+        """Include queued, dispatched and plant-level operations."""
+        return bool(
+            self._pending_setting_writes
+            or self._write_drain_scheduled
+            or self._write_drain_tasks
+            or any(lock.locked() for lock in self._write_locks.values())
+        )
+
     async def _async_get_session(self) -> aiohttp.ClientSession:
         if self._session is None or self._session.closed:
             self._session = aiohttp.ClientSession()
@@ -80,41 +98,19 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     @property
     def write_target_serials(self) -> list[str]:
-        """`self.serials`, collapsing a parallel group's slave into its
-        master.
+        """Deduplicate verified groups; unknown targets are never writable.
 
-        Callers that write the same setting to "every configured inverter"
-        (Tariff Manager, Virtual Slot Scheduler) used to do that literally —
-        fine for genuinely independent inverters, but for a parallel group
-        `async_write_setting` already redirects the slave's write to the
-        master (#21), so iterating both meant writing the same setting to
-        the master twice per tick. A second write landing right behind the
-        first was itself enough to make the master briefly reject/revert
-        one of them — the master's own repairs, not just the slave's, is
-        what gave this away. Use this instead of `self.serials` for any
-        write loop; keep using `self.serials` for reads (fetching data
-        still needs every configured serial).
+        Controllers use this list while polling still reads every serial.
         """
-
-        def _info(serial: str) -> dict[str, Any]:
-            return (self.data or {}).get(serial, {}).get("inverter", {})
-
-        has_master = any(
-            _info(s).get("parallel") and _info(s).get("equipMode") == 1
-            for s in self.serials
-        )
-        if not has_master:
-            # No confirmed master anywhere (e.g. a momentary bad poll) —
-            # don't guess at dropping a serial with nothing left to cover it.
-            return list(self.serials)
-
-        return [
-            serial
-            for serial in self.serials
-            if not (
-                _info(serial).get("parallel") and _info(serial).get("equipMode") == 0
-            )
-        ]
+        targets = []
+        for serial in self.serials:
+            try:
+                target = SunsynkCoordinator.resolve_write_target(self, serial)
+            except UpdateFailed:
+                continue
+            if target not in targets:
+                targets.append(target)
+        return targets
 
     async def _async_update_data(self) -> dict[str, dict[str, Any]]:
         """Fetch data from all inverter endpoints."""
@@ -135,7 +131,9 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
         ir.async_delete_issue(self.hass, DOMAIN, f"auth_failed_{self._entry_id}")
 
-        client = SunsynkClient(self._auth._api_server, token)
+        client = SunsynkClient(
+            self._auth._api_server, token, write_policy=self.write_policy
+        )
 
         result: dict[str, dict[str, Any]] = {}
         inverter_failures: list[tuple[str, Exception]] = []
@@ -164,6 +162,7 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
                 # path for this inverter.
                 result[serial] = dict(self.data.get(serial, {})) if self.data else {}
                 result[serial]["battery"] = {}
+                result[serial]["inverter"] = {}
                 ir.async_create_issue(
                     self.hass,
                     DOMAIN,
@@ -214,46 +213,101 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         return result
 
     def resolve_write_target(self, serial: str) -> str:
-        """Return the physical inverter that owns writes for ``serial``.
+        """Resolve only explicitly configured groups with verified cached roles."""
+        if (
+            serial not in self.serials
+            or getattr(self, "last_update_success", True) is False
+        ):
+            raise UpdateFailed("Writes require a successful topology poll")
+        target = next(
+            (
+                target
+                for target, profile in self.write_profiles.items()
+                if serial in profile.members
+            ),
+            None,
+        )
+        if target is None:
+            raise UpdateFailed(
+                "Configure a write profile with verified membership and site limits before writing"
+            )
+        infos = {
+            member: (self.data or {}).get(member, {}).get("inverter", {})
+            for member in self.write_profiles[target].members
+        }
+        SunsynkCoordinator._validate_write_topology(self, target, infos)
+        return target
 
-        Independent inverters resolve to themselves.  A parallel-group slave
-        resolves to the group's master, because settings written to the slave
-        are synchronised back from the master and do not persist.
+    def _validate_write_topology(
+        self, target: str, infos: dict[str, dict[str, Any]]
+    ) -> int:
+        """Verify roles, plant membership and rated power without a fallback target."""
+        profile = self.write_profiles[target]
+        plant_ids = set()
+        rated_power = 0
+        try:
+            for member in profile.members:
+                info = infos[member]
+                if info.get("sn", member) != member:
+                    raise SunsynkSettingValidationError("Unexpected inverter serial")
+                parallel = validate_setting_value("batteryOn", info.get("parallel"))
+                if len(profile.members) == 1:
+                    if parallel:
+                        raise SunsynkSettingValidationError(
+                            "Parallel membership is incomplete"
+                        )
+                elif not parallel or validate_setting_value(
+                    "energyMode", info.get("equipMode")
+                ) != (1 if member == target else 0):
+                    raise SunsynkSettingValidationError(
+                        "Parallel master/slave roles do not match the configured group"
+                    )
+                plant_id = info.get("plant", {}).get("id")
+                if plant_id is None or isinstance(plant_id, bool) or not str(plant_id):
+                    raise SunsynkSettingValidationError("Plant identity is missing")
+                plant_ids.add(str(plant_id))
+                power = validate_setting_value("pvMaxLimit", info.get("ratePower"))
+                if power == 0:
+                    raise SunsynkSettingValidationError("Rated power is unknown")
+                if member == target or profile.power_scope == "group":
+                    rated_power += power
+            if len(plant_ids) != 1:
+                raise SunsynkSettingValidationError(
+                    "Members belong to different plants"
+                )
+        except (
+            KeyError,
+            TypeError,
+            AttributeError,
+            SunsynkSettingValidationError,
+        ) as err:
+            raise UpdateFailed(f"Unverified write topology: {err}") from err
+        return rated_power
 
-        #21: a parallel/multi-inverter account showed chargeCurrent and
-        dischargeCurrent corrupted on BOTH units (0 on the slave, a wildly
-        out-of-range value on the master) after this integration wrote them
-        to each configured serial independently. `equipMode` (0 = slave,
-        1 = master) and `parallel` are already present in the `inverter`
-        data fetched every poll; non-parallel accounts don't have `parallel`
-        set, so they're unaffected.
+    async def _async_read_write_topology(
+        self, client: SunsynkClient, session: aiohttp.ClientSession, target: str
+    ) -> tuple[dict[str, dict[str, Any]], int]:
+        """Read every declared member before authorizing the physical target."""
+        infos = {
+            member: await client.async_get_inverter_info(session, member)
+            for member in self.write_profiles[target].members
+        }
+        return infos, SunsynkCoordinator._validate_write_topology(self, target, infos)
 
-        Originally scoped to battery settings only — an earlier diagnostics
-        dump showed System Mode Timer slot settings (time1on/sellTime1/etc.)
-        verifying correctly when written to each unit independently. That
-        turned out to be an artifact of the verification delay (2s) being
-        shorter than the actual sync window: the same reporter later wrote a
-        slot's start time directly to the slave *on the Sunsynk portal
-        itself* (bypassing this integration entirely) and watched the
-        portal silently revert it back to the master's value 10-15 seconds
-        later. So a 2-second verification read can land before that revert
-        and look successful, while the value doesn't actually stick. Since
-        the slave was never going to keep an independent value for *any*
-        setting, redirecting only some categories was an artificially
-        narrow fix — now applied to every setting.
-        """
-        inverter_info = (self.data or {}).get(serial, {}).get("inverter", {})
-        if not inverter_info.get("parallel") or inverter_info.get("equipMode") == 1:
-            return serial
-
-        for other_serial in self.serials:
-            if other_serial == serial:
-                continue
-            other_info = (self.data or {}).get(other_serial, {}).get("inverter", {})
-            if other_info.get("parallel") and other_info.get("equipMode") == 1:
-                return other_serial
-
-        return serial
+    def scheduled_power_limit(self, serial: str, *, exporting: bool = False) -> int:
+        """Use confirmed register scope and site limits; never invent rated power."""
+        target = SunsynkCoordinator.resolve_write_target(self, serial)
+        profile = self.write_profiles[target]
+        infos = {
+            member: (self.data or {}).get(member, {}).get("inverter", {})
+            for member in profile.members
+        }
+        rated = SunsynkCoordinator._validate_write_topology(self, target, infos)
+        return min(
+            rated,
+            profile.max_power_w,
+            profile.max_export_power_w if exporting else profile.max_power_w,
+        )
 
     def _resolve_parallel_write_target(self, serial: str, setting_key: str) -> str:
         """Backward-compatible internal wrapper for write routing."""
@@ -309,6 +363,7 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         """
         if not settings:
             return
+        self.write_policy.ensure_writable()
         # Validate the complete caller-supplied batch before mutating queue
         # state. A bad field must not allow valid siblings to leak to the API.
         settings = validate_setting_batch(settings)
@@ -385,6 +440,7 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         self, serial: str, updates: dict[str, Any]
     ) -> dict[str, Exception]:
         """Write one coalesced batch and return failures keyed by setting."""
+        self.write_policy.ensure_writable()
         session = await self._async_get_session()
         try:
             token = await self._auth.async_get_token(session)
@@ -392,77 +448,107 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
             error = UpdateFailed(f"Authentication failed: {err}")
             return {key: error for key in updates}
 
-        client = SunsynkClient(self._auth._api_server, token)
-        # Never put an optimistic value in the coordinator cache: the write
-        # endpoint can acknowledge a command which the inverter then rejects.
-        current_settings = dict((self.data or {}).get(serial, {}).get("settings", {}))
-        if not current_settings:
-            try:
-                current_settings = dict(
-                    await client.async_get_settings(session, serial)
-                )
-            except SunsynkAuthenticationError as err:
-                self._auth.invalidate_token()
-                error = UpdateFailed(f"Authentication failed: {err}")
-                return {key: error for key in updates}
-            except SunsynkApiError as err:
-                error = UpdateFailed(f"Cannot read settings for {serial}: {err}")
-                return {key: error for key in updates}
+        self.write_policy.ensure_writable()
+        client = SunsynkClient(
+            self._auth._api_server, token, write_policy=self.write_policy
+        )
+        profile = self.write_profiles[serial]
+        try:
+            # Re-read topology at dispatch: a cached role never authorizes a POST.
+            _infos, rated_power = await SunsynkCoordinator._async_read_write_topology(
+                self, client, session, serial
+            )
+            baseline = dict(await client.async_get_settings(session, serial))
+            updates = validate_installation_settings(
+                updates, baseline, profile, rated_power
+            )
+        except SunsynkAuthenticationError as err:
+            self._auth.invalidate_token()
+            return {
+                key: UpdateFailed(f"Authentication failed: {err}") for key in updates
+            }
+        except (SunsynkApiError, SunsynkSettingValidationError, UpdateFailed) as err:
+            return {
+                key: UpdateFailed(f"Write preflight failed: {err}") for key in updates
+            }
 
         grouped_updates: dict[frozenset[str], dict[str, Any]] = {}
         for key, value in updates.items():
-            allowed_keys = SunsynkCoordinator._allowed_setting_group(key)
-            grouped_updates.setdefault(allowed_keys, {})[key] = value
+            group = SunsynkCoordinator._allowed_setting_group(key)
+            grouped_updates.setdefault(group, {})[key] = value
 
-        failures: dict[str, Exception] = {}
-        written: dict[str, Any] = {}
-        for allowed_keys, group_updates in grouped_updates.items():
-            payload: dict[str, Any] = {
-                key: value
-                for key, value in current_settings.items()
-                if key in allowed_keys and value is not None
-            }
-            payload.update(group_updates)
-            payload["sn"] = serial
+        for group, changes in grouped_updates.items():
             try:
-                # Group writes also resend cached sibling values. Validate all
-                # writable siblings, not just the caller's changed fields, so
-                # a corrupt cached current/SOC/power cannot hitch a ride.
-                for key in payload.keys() & WRITABLE_SETTING_KEYS:
-                    payload[key] = validate_setting_value(key, payload[key])
-            except SunsynkSettingValidationError as err:
-                error = UpdateFailed(
-                    f"Unsafe cached setting blocks write of "
-                    f"{', '.join(group_updates)}: {err}"
+                fresh = dict(await client.async_get_settings(session, serial))
+                # Without cloud compare-and-swap, reject detectable external edits.
+                watched = group - {"sn"}
+                if any(
+                    not SunsynkCoordinator._values_match(
+                        baseline.get(key), fresh.get(key)
+                    )
+                    for key in watched
+                    if key in baseline or key in fresh
+                ):
+                    raise UpdateFailed(
+                        "Settings changed during write preparation; refresh and retry"
+                    )
+                changes = validate_installation_settings(
+                    changes, fresh, profile, rated_power
                 )
-                failures.update({key: error for key in group_updates})
-                continue
-            try:
-                await client.async_write_settings(session, serial, payload)
+                # Timer companions are required by the API; battery/system edits are minimal.
+                payload = dict(changes)
+                if group in SLOT_SETTING_KEY_GROUPS.values():
+                    required = {key for key in group if not key.endswith("Volt")}
+                    if not required <= fresh.keys():
+                        raise UpdateFailed(
+                            "A complete timer slot is required before writing"
+                        )
+                    payload = {
+                        key: value for key, value in fresh.items() if key in group
+                    }
+                    payload.update(changes)
+                payload = validate_setting_payload(payload, fresh, profile, rated_power)
+                # Revalidate roles again after reads, immediately before dispatch.
+                (
+                    _infos,
+                    latest_rated,
+                ) = await SunsynkCoordinator._async_read_write_topology(
+                    self, client, session, serial
+                )
+                payload = validate_setting_payload(
+                    payload, fresh, profile, latest_rated
+                )
+                await client.async_write_settings(
+                    session, serial, {**payload, "sn": serial}
+                )
+                expected = {
+                    key: value for key, value in fresh.items() if key in watched
+                }
+                expected.update(changes)
+                await SunsynkCoordinator._async_verify_writes(
+                    self, client, session, serial, expected
+                )
+                baseline.update(changes)
             except SunsynkAuthenticationError as err:
                 self._auth.invalidate_token()
-                error = UpdateFailed(f"Authentication failed: {err}")
-                return {key: error for key in updates}
-            except SunsynkApiError as err:
-                error = UpdateFailed(
-                    f"Failed to write settings {', '.join(group_updates)}: {err}"
-                )
-                failures.update({key: error for key in group_updates})
-                continue
-
-            written.update(group_updates)
-            current_settings.update(payload)
-
-        if written:
-            try:
-                await SunsynkCoordinator._async_verify_writes(
-                    self, client, session, serial, written
-                )
-            except UpdateFailed as err:
-                failures.update({key: err for key in written})
-            else:
-                await self.async_request_refresh()
-        return failures
+                return {
+                    key: UpdateFailed(f"Authentication failed: {err}")
+                    for key in updates
+                }
+            except (
+                SunsynkApiError,
+                SunsynkSettingValidationError,
+                UpdateFailed,
+            ) as err:
+                # Earlier groups may already be applied; never imply batch atomicity.
+                return {
+                    key: UpdateFailed(
+                        f"Write failed; settings may be partially applied: {err}"
+                    )
+                    for key in updates
+                }
+        await self.async_request_refresh()
+        return {}
 
     async def _async_verify_write(
         self,
@@ -596,6 +682,7 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
 
     async def async_write_plant_price(self, serial: str, price: float) -> None:
         """Serialize a plant-price write with every inverter setting write."""
+        self.write_policy.ensure_writable()
         price = validate_plant_price(price)
         serial = SunsynkCoordinator.resolve_write_target(self, serial)
         async with SunsynkCoordinator._write_lock_for(self, serial):
@@ -619,29 +706,22 @@ class SunsynkCoordinator(DataUpdateCoordinator[dict[str, dict[str, Any]]]):
         except SunsynkAuthError as err:
             raise UpdateFailed(f"Authentication failed: {err}") from err
 
-        client = SunsynkClient(self._auth._api_server, token)
+        client = SunsynkClient(
+            self._auth._api_server, token, write_policy=self.write_policy
+        )
 
-        plant_id = (self.data or {}).get(serial, {}).get("plant", {}).get("id")
-        if not plant_id:
-            # Cache may simply predate a successful plant lookup (e.g. right
-            # after startup, or a previous refresh's plant fetch failed) —
-            # try once more against a fresh inverter-info fetch before
-            # concluding there's genuinely no plant linked to this inverter.
-            try:
-                inverter_info = await client.async_get_inverter_info(session, serial)
-            except SunsynkAuthenticationError as err:
-                self._auth.invalidate_token()
-                raise UpdateFailed(f"Authentication failed: {err}") from err
-            except SunsynkApiError as err:
-                raise UpdateFailed(
-                    f"Cannot read inverter info for {serial}: {err}"
-                ) from err
-            plant_id = (inverter_info.get("plant") or {}).get("id")
-            if not plant_id:
-                raise UpdateFailed(
-                    f"No plant found for inverter {serial} — this Sunsynk/Deye "
-                    "account may not have a plant linked to this inverter."
-                )
+        try:
+            infos, _rated = await SunsynkCoordinator._async_read_write_topology(
+                self, client, session, serial
+            )
+        except SunsynkAuthenticationError as err:
+            self._auth.invalidate_token()
+            raise UpdateFailed(f"Authentication failed: {err}") from err
+        except SunsynkApiError as err:
+            raise UpdateFailed(
+                f"Cannot read inverter info for {serial}: {err}"
+            ) from err
+        plant_id = infos[serial]["plant"]["id"]
 
         try:
             plant = await client.async_get_plant_info(session, str(plant_id))

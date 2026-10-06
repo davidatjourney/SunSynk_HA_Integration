@@ -5,13 +5,17 @@ flow harness (hass.config_entries.flow.async_init(...)) to exercise
 properly — out of scope here. This covers the two pieces of real logic
 that don't require that: credential validation and tariff-field parsing.
 """
+
 from __future__ import annotations
 
+import json
+from dataclasses import asdict
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from tests.conftest import write_profile
 from custom_components.sunsynk.api.auth import SunsynkAuthError
 from custom_components.sunsynk.config_flow import (
     SunsynkConfigFlow,
@@ -29,6 +33,14 @@ def _user_input(**updates):
         "refresh_interval": 300,
     }
     data.update(updates)
+    if data.get("access_mode") == "read_write":
+        serials = [s.strip() for s in data["serials"].split(";") if s.strip()]
+        data.setdefault(
+            "write_profiles",
+            json.dumps(
+                {s: {**asdict(write_profile(s)), "members": [s]} for s in serials}
+            ),
+        )
     return data
 
 
@@ -36,18 +48,24 @@ def _user_input(**updates):
 async def test_config_flow_all_user_outcomes():
     flow = SunsynkConfigFlow()
     assert (await flow.async_step_user())["type"] == "form"
-    assert (await flow.async_step_user(_user_input(serials="  ")))["errors"]["serials"] == "invalid_serials"
+    assert (await flow.async_step_user(_user_input(serials="  ")))["errors"][
+        "serials"
+    ] == "invalid_serials"
 
     with patch(
         "custom_components.sunsynk.config_flow._async_validate_credentials",
         new=AsyncMock(side_effect=SunsynkAuthError("bad")),
     ):
-        assert (await flow.async_step_user(_user_input()))["errors"]["base"] == "invalid_auth"
+        assert (await flow.async_step_user(_user_input()))["errors"][
+            "base"
+        ] == "invalid_auth"
     with patch(
         "custom_components.sunsynk.config_flow._async_validate_credentials",
         new=AsyncMock(side_effect=RuntimeError("offline")),
     ):
-        assert (await flow.async_step_user(_user_input()))["errors"]["base"] == "cannot_connect"
+        assert (await flow.async_step_user(_user_input()))["errors"][
+            "base"
+        ] == "cannot_connect"
 
     flow.async_set_unique_id = AsyncMock()
     flow._abort_if_unique_id_configured = MagicMock()
@@ -68,6 +86,7 @@ def _options_flow():
     entry.options = {}
     flow = SunsynkOptionsFlow(entry)
     flow.hass = SimpleNamespace(
+        data={},
         config=SimpleNamespace(latitude=51.0, longitude=-1.0),
         config_entries=MagicMock(),
     )
@@ -89,11 +108,15 @@ async def test_options_flow_form_validation_and_success_paths():
 
     base = _user_input(password="")
     missing_credentials = {**base, "username": "", "password": ""}
-    assert (
-        await flow.async_step_init(missing_credentials)
-    )["errors"]["base"] == "invalid_auth"
-    assert (await flow.async_step_init({**base, "serials": ""}))["errors"]["serials"] == "invalid_serials"
-    assert (await flow.async_step_init({**base, "panel_kwp": "bad"}))["errors"]["base"] == "invalid_forecast_config"
+    assert (await flow.async_step_init(missing_credentials))["errors"][
+        "base"
+    ] == "invalid_auth"
+    assert (await flow.async_step_init({**base, "serials": ""}))["errors"][
+        "serials"
+    ] == "invalid_serials"
+    assert (await flow.async_step_init({**base, "panel_kwp": "bad"}))["errors"][
+        "base"
+    ] == "invalid_forecast_config"
     for overrides in (
         {"panel_kwp": "nan"},
         {"panel_kwp": "8", "latitude": "91"},
@@ -139,7 +162,9 @@ async def test_options_flow_credential_change_outcomes():
     changed = _user_input(username="new@example.com", password="new-secret")
     duplicate = MagicMock(entry_id="other", unique_id="api.sunsynk.net_new@example.com")
     flow.hass.config_entries.async_entries.return_value = [duplicate]
-    assert (await flow.async_step_init(changed))["errors"]["base"] == "already_configured"
+    assert (await flow.async_step_init(changed))["errors"][
+        "base"
+    ] == "already_configured"
 
     flow.hass.config_entries.async_entries.return_value = []
     with patch(
@@ -151,7 +176,9 @@ async def test_options_flow_credential_change_outcomes():
         "custom_components.sunsynk.config_flow._async_validate_credentials",
         new=AsyncMock(side_effect=RuntimeError("offline")),
     ):
-        assert (await flow.async_step_init(changed))["errors"]["base"] == "cannot_connect"
+        assert (await flow.async_step_init(changed))["errors"][
+            "base"
+        ] == "cannot_connect"
     with patch(
         "custom_components.sunsynk.config_flow._async_validate_credentials",
         new=AsyncMock(),
@@ -182,7 +209,10 @@ class TestAsyncValidateCredentials:
         mock_auth = AsyncMock()
         mock_auth.async_get_token = AsyncMock(return_value="token")
         with (
-            patch("custom_components.sunsynk.config_flow.SunsynkAuth", return_value=mock_auth),
+            patch(
+                "custom_components.sunsynk.config_flow.SunsynkAuth",
+                return_value=mock_auth,
+            ),
             patch(
                 "custom_components.sunsynk.config_flow.aiohttp.ClientSession",
                 _fake_client_session_cm(),
@@ -196,7 +226,10 @@ class TestAsyncValidateCredentials:
         mock_auth = AsyncMock()
         mock_auth.async_get_token = AsyncMock(side_effect=SunsynkAuthError("bad creds"))
         with (
-            patch("custom_components.sunsynk.config_flow.SunsynkAuth", return_value=mock_auth),
+            patch(
+                "custom_components.sunsynk.config_flow.SunsynkAuth",
+                return_value=mock_auth,
+            ),
             patch(
                 "custom_components.sunsynk.config_flow.aiohttp.ClientSession",
                 _fake_client_session_cm(),
@@ -214,19 +247,23 @@ class TestParseTariffFields:
     @pytest.mark.parametrize("value", ["nan", "inf", "-inf"])
     def test_price_threshold_must_be_finite(self, value):
         with pytest.raises(ValueError, match="must be finite"):
-            SunsynkOptionsFlow._parse_tariff_fields({
-                "cheap_threshold": value,
-                "cheap_charge_current": "50",
-                "normal_charge_current": "50",
-            })
+            SunsynkOptionsFlow._parse_tariff_fields(
+                {
+                    "cheap_threshold": value,
+                    "cheap_charge_current": "50",
+                    "normal_charge_current": "50",
+                }
+            )
 
     def test_full_cheap_charging_block_parsed(self):
-        result = SunsynkOptionsFlow._parse_tariff_fields({
-            "cheap_threshold": "0.10",
-            "cheap_charge_current": "100",
-            "normal_charge_current": "50",
-            "cheap_target_soc": 90,
-        })
+        result = SunsynkOptionsFlow._parse_tariff_fields(
+            {
+                "cheap_threshold": "0.10",
+                "cheap_charge_current": "100",
+                "normal_charge_current": "50",
+                "cheap_target_soc": 90,
+            }
+        )
         assert result["cheap_threshold"] == 0.10
         assert result["cheap_charge_current"] == 100
         assert result["normal_charge_current"] == 50
@@ -238,27 +275,33 @@ class TestParseTariffFields:
 
     def test_cheap_charging_current_must_be_positive(self):
         with pytest.raises(ValueError, match="must be positive"):
-            SunsynkOptionsFlow._parse_tariff_fields({
-                "cheap_threshold": "0.10",
-                "cheap_charge_current": "0",
-                "normal_charge_current": "50",
-            })
+            SunsynkOptionsFlow._parse_tariff_fields(
+                {
+                    "cheap_threshold": "0.10",
+                    "cheap_charge_current": "0",
+                    "normal_charge_current": "50",
+                }
+            )
 
     def test_cheap_charging_current_has_safe_upper_limit(self):
         with pytest.raises(ValueError, match="no greater than 300"):
-            SunsynkOptionsFlow._parse_tariff_fields({
-                "cheap_threshold": "0.10",
-                "cheap_charge_current": "301",
-                "normal_charge_current": "50",
-            })
+            SunsynkOptionsFlow._parse_tariff_fields(
+                {
+                    "cheap_threshold": "0.10",
+                    "cheap_charge_current": "301",
+                    "normal_charge_current": "50",
+                }
+            )
 
     def test_full_expensive_discharging_block_parsed(self):
-        result = SunsynkOptionsFlow._parse_tariff_fields({
-            "expensive_threshold": "0.30",
-            "peak_discharge_current": "100",
-            "normal_discharge_current": "50",
-            "discharge_min_soc": 10,
-        })
+        result = SunsynkOptionsFlow._parse_tariff_fields(
+            {
+                "expensive_threshold": "0.30",
+                "peak_discharge_current": "100",
+                "normal_discharge_current": "50",
+                "discharge_min_soc": 10,
+            }
+        )
         assert result["expensive_threshold"] == 0.30
         assert result["peak_discharge_current"] == 100
         assert result["normal_discharge_current"] == 50
@@ -270,19 +313,23 @@ class TestParseTariffFields:
 
     def test_discharge_current_must_be_positive(self):
         with pytest.raises(ValueError, match="must be positive"):
-            SunsynkOptionsFlow._parse_tariff_fields({
-                "expensive_threshold": "0.30",
-                "peak_discharge_current": "-5",
-                "normal_discharge_current": "50",
-            })
+            SunsynkOptionsFlow._parse_tariff_fields(
+                {
+                    "expensive_threshold": "0.30",
+                    "peak_discharge_current": "-5",
+                    "normal_discharge_current": "50",
+                }
+            )
 
     def test_discharge_current_has_safe_upper_limit(self):
         with pytest.raises(ValueError, match="no greater than 300"):
-            SunsynkOptionsFlow._parse_tariff_fields({
-                "expensive_threshold": "0.30",
-                "peak_discharge_current": "301",
-                "normal_discharge_current": "50",
-            })
+            SunsynkOptionsFlow._parse_tariff_fields(
+                {
+                    "expensive_threshold": "0.30",
+                    "peak_discharge_current": "301",
+                    "normal_discharge_current": "50",
+                }
+            )
 
     def test_schedule_requires_both_hours(self):
         with pytest.raises(ValueError, match="requires both"):
@@ -290,16 +337,20 @@ class TestParseTariffFields:
 
     def test_schedule_hours_must_be_in_range(self):
         with pytest.raises(ValueError, match="0–23"):
-            SunsynkOptionsFlow._parse_tariff_fields({
-                "tariff_start_hour": "22",
-                "tariff_end_hour": "24",
-            })
+            SunsynkOptionsFlow._parse_tariff_fields(
+                {
+                    "tariff_start_hour": "22",
+                    "tariff_end_hour": "24",
+                }
+            )
 
     def test_valid_schedule_parsed(self):
-        result = SunsynkOptionsFlow._parse_tariff_fields({
-            "tariff_start_hour": "22",
-            "tariff_end_hour": "6",
-        })
+        result = SunsynkOptionsFlow._parse_tariff_fields(
+            {
+                "tariff_start_hour": "22",
+                "tariff_end_hour": "6",
+            }
+        )
         assert result["tariff_start_hour"] == 22
         assert result["tariff_end_hour"] == 6
 
@@ -308,9 +359,31 @@ class TestParseTariffFields:
         assert result["price_max_age"] == 30
 
     def test_blank_strings_treated_as_not_set(self):
-        result = SunsynkOptionsFlow._parse_tariff_fields({
-            "cheap_threshold": "  ",
-            "expensive_threshold": "",
-        })
+        result = SunsynkOptionsFlow._parse_tariff_fields(
+            {
+                "cheap_threshold": "  ",
+                "expensive_threshold": "",
+            }
+        )
         assert "cheap_threshold" not in result
         assert "expensive_threshold" not in result
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["bad", "{}"])
+async def test_write_enabled_setup_requires_valid_complete_profiles(profile):
+    flow = SunsynkConfigFlow()
+    result = await flow.async_step_user(
+        _user_input(access_mode="read_write", write_profiles=profile)
+    )
+    assert result["errors"]["write_profiles"] == "invalid_write_profiles"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("profile", ["bad", "{}"])
+async def test_write_enabled_options_require_valid_complete_profiles(profile):
+    flow = _options_flow()
+    result = await flow.async_step_init(
+        _user_input(password="", access_mode="read_write", write_profiles=profile)
+    )
+    assert result["errors"]["write_profiles"] == "invalid_write_profiles"

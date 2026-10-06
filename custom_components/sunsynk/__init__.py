@@ -20,6 +20,9 @@ from homeassistant.helpers.storage import Store
 from .api.auth import SunsynkAuth
 from .calibration import PerformanceRatioCalibrator
 from .const import (
+    ACCESS_READ_ONLY,
+    ACCESS_READ_WRITE,
+    CONF_ACCESS_MODE,
     CONF_API_SERVER,
     CONF_CHEAP_CHARGE_CURRENT,
     CONF_CHEAP_TARGET_SOC,
@@ -41,6 +44,7 @@ from .const import (
     CONF_SERIALS,
     CONF_TARIFF_END_HOUR,
     CONF_TARIFF_START_HOUR,
+    CONF_WRITE_PROFILES,
     DEFAULT_CHEAP_TARGET_SOC,
     DEFAULT_DISCHARGE_MIN_SOC,
     DEFAULT_PERFORMANCE_RATIO,
@@ -58,7 +62,8 @@ from .virtual_slots import (
     VirtualSlot,
     VirtualSlotScheduler,
 )
-from .write_validation import MAX_CURRENT_A, MAX_POWER_W
+from .write_policy import WritePolicy
+from .write_validation import MAX_CURRENT_A, MAX_POWER_W, parse_write_profiles
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -246,7 +251,9 @@ def _find_virtual_slot_scheduler(
     schedulers: dict[str, VirtualSlotScheduler] = hass.data[DOMAIN].get(
         f"{entry_id}_vslots", {}
     )
-    return schedulers.get(coordinator.resolve_write_target(serial))
+    return schedulers.get(serial) or schedulers.get(
+        coordinator.resolve_write_target(serial)
+    )
 
 
 def _migrate_virtual_slot_entity_unique_ids(
@@ -405,6 +412,17 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
         serials=serials,
         refresh_interval=refresh_interval,
         entry_id=entry.entry_id,
+        write_profiles=parse_write_profiles(
+            entry.options.get(
+                CONF_WRITE_PROFILES, entry.data.get(CONF_WRITE_PROFILES, {})
+            ),
+            serials,
+        ),
+        write_policy=WritePolicy(
+            entry.options.get(
+                CONF_ACCESS_MODE, entry.data.get(CONF_ACCESS_MODE, ACCESS_READ_ONLY)
+            )
+        ),
     )
 
     await coordinator.async_config_entry_first_refresh()
@@ -495,7 +513,11 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
     legacy_data = await legacy_store.async_load() or {}
     legacy_slots = legacy_data.get("slots")
     vslot_schedulers: dict[str, VirtualSlotScheduler] = {}
-    for target_serial in coordinator.write_target_serials:
+    scheduler_targets = coordinator.write_target_serials
+    if not scheduler_targets:
+        # Local schedules remain editable while profiles/topology are unavailable.
+        scheduler_targets = list(coordinator.write_profiles) or coordinator.serials
+    for target_serial in scheduler_targets:
         scheduler = VirtualSlotScheduler(
             hass=hass,
             coordinator=coordinator,
@@ -747,5 +769,14 @@ async def _async_setup_dashboard(
 
 
 async def _async_update_listener(hass: HomeAssistant, entry: ConfigEntry) -> None:
-    """Handle options update."""
+    """Revoke writes before unloading an entry whose saved mode is read-only."""
+    if (
+        entry.options.get(
+            CONF_ACCESS_MODE, entry.data.get(CONF_ACCESS_MODE, ACCESS_READ_ONLY)
+        )
+        != ACCESS_READ_WRITE
+    ):
+        coordinator = hass.data.get(DOMAIN, {}).get(entry.entry_id)
+        if coordinator is not None:
+            coordinator.write_policy.revoke()
     await hass.config_entries.async_reload(entry.entry_id)

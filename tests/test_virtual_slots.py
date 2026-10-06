@@ -1,10 +1,15 @@
 """Tests for the virtual slot resolution engine."""
+
 from __future__ import annotations
 
 from datetime import datetime
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
+
+from homeassistant.helpers.update_coordinator import UpdateFailed
+from tests.conftest import inverter_info, write_profile
+from custom_components.sunsynk.write_validation import SunsynkSettingValidationError
 
 from custom_components.sunsynk.virtual_slots import (
     MODE_CHARGE,
@@ -45,7 +50,11 @@ def test_window_containing_wraps_midnight():
 
 def test_window_containing_respects_weekdays():
     slot = VirtualSlot(
-        slot_id=1, start="10:00", end="14:00", mode=MODE_CHARGE, weekdays=frozenset({MON})
+        slot_id=1,
+        start="10:00",
+        end="14:00",
+        mode=MODE_CHARGE,
+        weekdays=frozenset({MON}),
     )
     # 2024-01-02 is a Tuesday — slot only applies on Monday
     assert slot.window_containing(_dt(2024, 1, 2, 12, 0)) is None
@@ -53,7 +62,9 @@ def test_window_containing_respects_weekdays():
 
 
 def test_window_containing_disabled_returns_none():
-    slot = VirtualSlot(slot_id=1, start="10:00", end="14:00", mode=MODE_CHARGE, enabled=False)
+    slot = VirtualSlot(
+        slot_id=1, start="10:00", end="14:00", mode=MODE_CHARGE, enabled=False
+    )
     assert slot.window_containing(_dt(2024, 1, 1, 12, 0)) is None
 
 
@@ -124,9 +135,7 @@ def _consume_created_tasks(hass):
     hass.async_create_task.side_effect = _consume
 
 
-def test_lifecycle_listeners_enable_and_properties(
-    mock_hass, mock_coordinator
-):
+def test_lifecycle_listeners_enable_and_properties(mock_hass, mock_coordinator):
     _consume_created_tasks(mock_hass)
     tariff = MagicMock()
     unsub_coordinator = MagicMock()
@@ -181,18 +190,17 @@ async def test_disabled_tick_and_duplicate_idle_current_are_noops(
     sched._normal_charge_current = 20
     resolution = MagicMock(mode=MODE_IDLE, source="none", current=None)
     assert await sched._apply_current_if_changed(resolution) is True
-    assert await sched._apply_current_if_changed(
-        resolution
-    ) is False
+    assert await sched._apply_current_if_changed(resolution) is False
     mock_coordinator.async_write_setting.assert_awaited_once_with(
         "TEST123", "chargeCurrent", 20
     )
 
 
-def test_invalid_rated_power_falls_back(mock_hass, mock_coordinator):
+def test_invalid_rated_power_blocks_automatic_power(mock_hass, mock_coordinator):
     mock_coordinator.data["TEST123"]["inverter"] = {"ratePower": object()}
     sched = _make_scheduler(mock_hass, mock_coordinator)
-    assert sched._uncapped_sell_power() == sched._DEFAULT_UNCAPPED_SELL_POWER
+    with pytest.raises(UpdateFailed, match="topology"):
+        sched._uncapped_sell_power()
     assert sched._now() is not None
 
 
@@ -205,9 +213,7 @@ def test_disabled_slot_is_ignored_for_boundaries(mock_hass, mock_coordinator):
         mode=MODE_CHARGE,
         enabled=False,
     )
-    resolution, start, boundary = sched._resolve_virtual(
-        _dt(2024, 1, 1, 10, 30)
-    )
+    resolution, start, boundary = sched._resolve_virtual(_dt(2024, 1, 1, 10, 30))
     assert resolution.mode == MODE_IDLE
     assert start is None
     assert boundary is None
@@ -229,7 +235,9 @@ async def test_shutdown_failure_paths(mock_hass, mock_coordinator):
 
 def test_resolve_virtual_no_slots_is_idle(mock_hass, mock_coordinator):
     sched = _make_scheduler(mock_hass, mock_coordinator)
-    resolution, window_start, next_boundary = sched._resolve_virtual(_dt(2024, 1, 1, 12, 0))
+    resolution, window_start, next_boundary = sched._resolve_virtual(
+        _dt(2024, 1, 1, 12, 0)
+    )
     assert resolution.mode == MODE_IDLE
     assert window_start is None
     assert next_boundary is None
@@ -260,9 +268,16 @@ async def test_load_seeds_per_inverter_store_from_legacy_slots(
 def test_resolve_virtual_single_active_slot(mock_hass, mock_coordinator):
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="22:00", end="06:00", mode=MODE_CHARGE, current=100, target_soc=90
+        slot_id=1,
+        start="22:00",
+        end="06:00",
+        mode=MODE_CHARGE,
+        current=100,
+        target_soc=90,
     )
-    resolution, window_start, next_boundary = sched._resolve_virtual(_dt(2024, 1, 1, 23, 0))
+    resolution, window_start, next_boundary = sched._resolve_virtual(
+        _dt(2024, 1, 1, 23, 0)
+    )
     assert resolution.mode == MODE_CHARGE
     assert resolution.source == "virtual_slot:1"
     assert resolution.current == 100
@@ -278,17 +293,28 @@ def test_resolve_virtual_priority_tiebreak(mock_hass, mock_coordinator):
         slot_id=1, start="10:00", end="14:00", mode=MODE_CHARGE, priority=1, current=50
     )
     sched._slots[2] = VirtualSlot(
-        slot_id=2, start="12:00", end="13:00", mode=MODE_DISCHARGE, priority=5, current=80
+        slot_id=2,
+        start="12:00",
+        end="13:00",
+        mode=MODE_DISCHARGE,
+        priority=5,
+        current=80,
     )
     resolution, _, _ = sched._resolve_virtual(_dt(2024, 1, 1, 12, 30))
     assert resolution.source == "virtual_slot:2"
     assert resolution.mode == MODE_DISCHARGE
 
 
-def test_resolve_virtual_next_boundary_is_soonest_of_all_slots(mock_hass, mock_coordinator):
+def test_resolve_virtual_next_boundary_is_soonest_of_all_slots(
+    mock_hass, mock_coordinator
+):
     sched = _make_scheduler(mock_hass, mock_coordinator)
-    sched._slots[1] = VirtualSlot(slot_id=1, start="10:00", end="18:00", mode=MODE_CHARGE)
-    sched._slots[2] = VirtualSlot(slot_id=2, start="12:00", end="13:00", mode=MODE_DISCHARGE)
+    sched._slots[1] = VirtualSlot(
+        slot_id=1, start="10:00", end="18:00", mode=MODE_CHARGE
+    )
+    sched._slots[2] = VirtualSlot(
+        slot_id=2, start="12:00", end="13:00", mode=MODE_DISCHARGE
+    )
     # At 11:00 slot 1 is active (ends 18:00) but slot 2 starts at 12:00 first.
     _, _, next_boundary = sched._resolve_virtual(_dt(2024, 1, 1, 11, 0))
     assert next_boundary == _dt(2024, 1, 1, 12, 0)
@@ -318,7 +344,12 @@ def test_no_override_falls_back_to_virtual(mock_hass, mock_coordinator):
     tariff_manager.is_discharging_active_for.return_value = False
     sched = _make_scheduler(mock_hass, mock_coordinator, tariff_manager=tariff_manager)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="00:00", end="23:59", mode=MODE_CHARGE, current=50, target_soc=80
+        slot_id=1,
+        start="00:00",
+        end="23:59",
+        mode=MODE_CHARGE,
+        current=50,
+        target_soc=80,
     )
     plan = sched._plan(_dt(2024, 1, 1, 12, 0))
     assert plan.active_resolution.source == "virtual_slot:1"
@@ -330,13 +361,25 @@ def test_no_override_falls_back_to_virtual(mock_hass, mock_coordinator):
 def test_plan_assigns_earlier_time_to_slot1(mock_hass, mock_coordinator):
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="10:00", end="18:00", mode=MODE_CHARGE, current=40, target_soc=80
+        slot_id=1,
+        start="10:00",
+        end="18:00",
+        mode=MODE_CHARGE,
+        current=40,
+        target_soc=80,
     )
     sched._slots[2] = VirtualSlot(
-        slot_id=2, start="18:00", end="10:00", mode=MODE_DISCHARGE, current=30, target_soc=20,
+        slot_id=2,
+        start="18:00",
+        end="10:00",
+        mode=MODE_DISCHARGE,
+        current=30,
+        target_soc=20,
         sell_power=3000,
     )
-    plan = sched._plan(_dt(2024, 1, 1, 12, 0))  # slot 1 active, slot 2 upcoming at 18:00
+    plan = sched._plan(
+        _dt(2024, 1, 1, 12, 0)
+    )  # slot 1 active, slot 2 upcoming at 18:00
     assert plan.slot1_start == "10:00"
     assert plan.slot1.mode == MODE_CHARGE
     assert plan.slot6_start == "18:00"
@@ -353,16 +396,28 @@ def test_plan_puts_wrapping_active_window_on_slot6(mock_hass, mock_coordinator):
     """
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="23:30", end="05:30", mode=MODE_CHARGE, current=100, target_soc=90
+        slot_id=1,
+        start="23:30",
+        end="05:30",
+        mode=MODE_CHARGE,
+        current=100,
+        target_soc=90,
     )
     sched._slots[2] = VirtualSlot(
-        slot_id=2, start="05:30", end="23:30", mode=MODE_DISCHARGE, current=20, target_soc=20,
+        slot_id=2,
+        start="05:30",
+        end="23:30",
+        mode=MODE_DISCHARGE,
+        current=20,
+        target_soc=20,
         sell_power=4000,
     )
     # 01:00 — the wrapping charge window (started 23:30 yesterday) is active.
     plan = sched._plan(_dt(2024, 1, 2, 1, 0))
     assert plan.active_resolution.mode == MODE_CHARGE
-    assert plan.active_physical == 6, "the late-starting (23:30) active window must be on slot 6"
+    assert plan.active_physical == 6, (
+        "the late-starting (23:30) active window must be on slot 6"
+    )
     assert plan.slot6_start == "23:30"
     assert plan.slot1_start == "05:30"
     assert plan.slot1.mode == MODE_DISCHARGE
@@ -393,10 +448,17 @@ def _written(mock_coordinator) -> set[tuple[str, object]]:
 
 
 @pytest.mark.asyncio
-async def test_bootstrap_disables_unused_slots_and_writes_slot1(mock_hass, mock_coordinator):
+async def test_bootstrap_disables_unused_slots_and_writes_slot1(
+    mock_hass, mock_coordinator
+):
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="00:00", end="23:59", mode=MODE_CHARGE, current=60, target_soc=90
+        slot_id=1,
+        start="00:00",
+        end="23:59",
+        mode=MODE_CHARGE,
+        current=60,
+        target_soc=90,
     )
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
@@ -423,7 +485,7 @@ async def test_bootstrap_disables_unused_slots_and_writes_slot1(mock_hass, mock_
             "time1on": 1,
             "cap1": 90,
             # Not a discharge window: no artificial cap on house load (#21).
-            "sellTime1Pac": VirtualSlotScheduler._DEFAULT_UNCAPPED_SELL_POWER,
+            "sellTime1Pac": 30000,
             "sellTime1": "00:00",
             "sellTime1on": 0,
         }
@@ -458,13 +520,25 @@ async def test_queued_bootstrap_does_nothing_after_shutdown_started(
 async def test_bootstrap_pins_slot2_start_to_slot6_start(mock_hass, mock_coordinator):
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="10:00", end="18:00", mode=MODE_CHARGE, current=40, target_soc=80
+        slot_id=1,
+        start="10:00",
+        end="18:00",
+        mode=MODE_CHARGE,
+        current=40,
+        target_soc=80,
     )
     sched._slots[2] = VirtualSlot(
-        slot_id=2, start="18:00", end="10:00", mode=MODE_DISCHARGE, current=30, target_soc=20,
+        slot_id=2,
+        start="18:00",
+        end="10:00",
+        mode=MODE_DISCHARGE,
+        current=30,
+        target_soc=20,
         sell_power=3000,
     )
-    sched._now = lambda: _dt(2024, 1, 1, 12, 0)  # slot 1 active (10:00), slot 6 upcoming (18:00)
+    sched._now = lambda: _dt(
+        2024, 1, 1, 12, 0
+    )  # slot 1 active (10:00), slot 6 upcoming (18:00)
     sched._enabled = True
 
     await sched._async_bootstrap()
@@ -476,7 +550,12 @@ async def test_bootstrap_pins_slot2_start_to_slot6_start(mock_hass, mock_coordin
 async def test_slot2_boundary_not_rewritten_when_unchanged(mock_hass, mock_coordinator):
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="10:00", end="18:00", mode=MODE_CHARGE, current=40, target_soc=80
+        slot_id=1,
+        start="10:00",
+        end="18:00",
+        mode=MODE_CHARGE,
+        current=40,
+        target_soc=80,
     )
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
@@ -490,10 +569,17 @@ async def test_slot2_boundary_not_rewritten_when_unchanged(mock_hass, mock_coord
 
 
 @pytest.mark.asyncio
-async def test_slot2_boundary_updates_when_slot6_start_changes(mock_hass, mock_coordinator):
+async def test_slot2_boundary_updates_when_slot6_start_changes(
+    mock_hass, mock_coordinator
+):
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="10:00", end="18:00", mode=MODE_CHARGE, current=40, target_soc=80
+        slot_id=1,
+        start="10:00",
+        end="18:00",
+        mode=MODE_CHARGE,
+        current=40,
+        target_soc=80,
     )
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
@@ -503,7 +589,12 @@ async def test_slot2_boundary_updates_when_slot6_start_changes(mock_hass, mock_c
     mock_coordinator.async_write_setting.reset_mock()
     mock_coordinator.async_write_settings.reset_mock()
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="10:00", end="19:00", mode=MODE_CHARGE, current=40, target_soc=80
+        slot_id=1,
+        start="10:00",
+        end="19:00",
+        mode=MODE_CHARGE,
+        current=40,
+        target_soc=80,
     )
     await sched._async_tick()
 
@@ -511,7 +602,9 @@ async def test_slot2_boundary_updates_when_slot6_start_changes(mock_hass, mock_c
 
 
 @pytest.mark.asyncio
-async def test_tick_reassigns_physical_slot_across_midnight_wrap(mock_hass, mock_coordinator):
+async def test_tick_reassigns_physical_slot_across_midnight_wrap(
+    mock_hass, mock_coordinator
+):
     """slot 1 = 23:30-05:30 charge (wraps), slot 2 = 05:30-23:30 discharge.
 
     While the wrapping charge window is active (e.g. 01:00) it must sit on
@@ -520,10 +613,20 @@ async def test_tick_reassigns_physical_slot_across_midnight_wrap(mock_hass, mock
     """
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="23:30", end="05:30", mode=MODE_CHARGE, current=40, target_soc=80
+        slot_id=1,
+        start="23:30",
+        end="05:30",
+        mode=MODE_CHARGE,
+        current=40,
+        target_soc=80,
     )
     sched._slots[2] = VirtualSlot(
-        slot_id=2, start="05:30", end="23:30", mode=MODE_DISCHARGE, current=30, target_soc=20,
+        slot_id=2,
+        start="05:30",
+        end="23:30",
+        mode=MODE_DISCHARGE,
+        current=30,
+        target_soc=20,
         sell_power=3000,
     )
     sched._now = lambda: _dt(2024, 1, 2, 1, 0)
@@ -549,14 +652,21 @@ async def test_tick_reassigns_physical_slot_across_midnight_wrap(mock_hass, mock
 
 
 @pytest.mark.asyncio
-async def test_tick_does_not_apply_current_while_price_override_active(mock_hass, mock_coordinator):
+async def test_tick_does_not_apply_current_while_price_override_active(
+    mock_hass, mock_coordinator
+):
     tariff_manager = MagicMock()
     tariff_manager.is_charging_active_for.return_value = True
     tariff_manager.is_discharging_active_for.return_value = False
     tariff_manager.target_soc = 95
     sched = _make_scheduler(mock_hass, mock_coordinator, tariff_manager=tariff_manager)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="00:00", end="23:59", mode=MODE_DISCHARGE, current=30, target_soc=20
+        slot_id=1,
+        start="00:00",
+        end="23:59",
+        mode=MODE_DISCHARGE,
+        current=30,
+        target_soc=20,
     )
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
@@ -596,8 +706,13 @@ async def test_shutdown_disables_slot1_and_slot6(mock_hass, mock_coordinator):
 async def test_discharge_slot_enables_sell_permission(mock_hass, mock_coordinator):
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="00:00", end="23:59", mode=MODE_DISCHARGE, current=30,
-        target_soc=20, sell_power=3000,
+        slot_id=1,
+        start="00:00",
+        end="23:59",
+        mode=MODE_DISCHARGE,
+        current=30,
+        target_soc=20,
+        sell_power=3000,
     )
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
@@ -612,7 +727,12 @@ async def test_discharge_slot_enables_sell_permission(mock_hass, mock_coordinato
 async def test_charge_slot_does_not_enable_sell_permission(mock_hass, mock_coordinator):
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="00:00", end="23:59", mode=MODE_CHARGE, current=60, target_soc=90
+        slot_id=1,
+        start="00:00",
+        end="23:59",
+        mode=MODE_CHARGE,
+        current=60,
+        target_soc=90,
     )
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
@@ -637,7 +757,9 @@ async def test_idle_slot_does_not_enable_sell_permission(mock_hass, mock_coordin
 
 
 @pytest.mark.asyncio
-async def test_price_override_discharge_enables_sell_permission(mock_hass, mock_coordinator):
+async def test_price_override_discharge_enables_sell_permission(
+    mock_hass, mock_coordinator
+):
     """A live Tariff Manager discharge override goes through the same
     physical-slot write path, so it needs sellTime{n}on too."""
     tariff_manager = MagicMock()
@@ -673,7 +795,7 @@ async def test_shutdown_restores_exact_pre_ownership_settings(
         "chargeCurrent": 47,
         "dischargeCurrent": 53,
     }
-    mock_coordinator.data["TEST123"]["settings"].update(original)
+    mock_coordinator.data["TEST123"]["settings"] = {"batteryLowCap": 20, **original}
     sched = _make_scheduler(
         mock_hass,
         mock_coordinator,
@@ -717,9 +839,7 @@ async def test_shutdown_continues_restoring_after_one_setting_fails(
 
 
 @pytest.mark.asyncio
-async def test_shutdown_uses_live_tariff_normal_currents(
-    mock_hass, mock_coordinator
-):
+async def test_shutdown_uses_live_tariff_normal_currents(mock_hass, mock_coordinator):
     tariff_manager = MagicMock(
         normal_charge_current=61,
         normal_discharge_current=62,
@@ -771,7 +891,7 @@ async def test_price_override_discharge_uses_inverter_rated_power_as_sell_cap(
 
 
 @pytest.mark.asyncio
-async def test_price_override_discharge_falls_back_to_default_when_rate_power_unknown(
+async def test_price_override_discharge_blocks_when_rate_power_unknown(
     mock_hass, mock_coordinator
 ):
     tariff_manager = MagicMock()
@@ -782,11 +902,10 @@ async def test_price_override_discharge_falls_back_to_default_when_rate_power_un
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
 
-    await sched._async_bootstrap()
-
-    written = dict(_written(mock_coordinator))
-    assert written["sellTime1Pac"] == VirtualSlotScheduler._DEFAULT_UNCAPPED_SELL_POWER
-    assert written["sellTime1Pac"] > 0
+    mock_coordinator.data["TEST123"]["inverter"] = inverter_info(power=0)
+    with pytest.raises(UpdateFailed, match="topology"):
+        await sched._async_bootstrap()
+    assert not any(key.startswith("sellTime") for key, _ in _written(mock_coordinator))
 
 
 # ── write_target_serials dedup: a parallel slave's writes are skipped ───────
@@ -806,9 +925,25 @@ async def test_bootstrap_never_calls_write_setting_for_a_parallel_slave(
 ):
     mock_coordinator.serials = ["SLAVE1", "MASTER1"]
     mock_coordinator.write_target_serials = ["MASTER1"]  # slave collapsed in
+    mock_coordinator.write_profiles = {
+        "MASTER1": write_profile("MASTER1", ["MASTER1", "SLAVE1"])
+    }
+    settings = mock_coordinator.data["TEST123"]["settings"]
+    mock_coordinator.data = {
+        "MASTER1": {
+            "inverter": inverter_info("MASTER1", parallel=True),
+            "settings": settings,
+        },
+        "SLAVE1": {"inverter": inverter_info("SLAVE1", parallel=True, master=False)},
+    }
     sched = _make_scheduler(mock_hass, mock_coordinator, serial="MASTER1")
     sched._slots[1] = VirtualSlot(
-        slot_id=1, start="00:00", end="23:59", mode=MODE_CHARGE, current=60, target_soc=90
+        slot_id=1,
+        start="00:00",
+        end="23:59",
+        mode=MODE_CHARGE,
+        current=60,
+        target_soc=90,
     )
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
@@ -831,6 +966,15 @@ async def test_scheduler_writes_only_its_independent_target(
     mock_hass, mock_coordinator
 ):
     mock_coordinator.write_target_serials = ["INV1", "INV2"]
+    mock_coordinator.serials = ["INV1", "INV2"]
+    mock_coordinator.write_profiles = {
+        serial: write_profile(serial) for serial in mock_coordinator.serials
+    }
+    settings = mock_coordinator.data["TEST123"]["settings"]
+    mock_coordinator.data = {
+        serial: {"inverter": inverter_info(serial), "settings": settings}
+        for serial in mock_coordinator.serials
+    }
     sched = _make_scheduler(mock_hass, mock_coordinator, serial="INV2")
     sched._slots[1] = VirtualSlot(
         slot_id=1,
@@ -929,18 +1073,14 @@ async def test_target_soc_below_battery_low_capacity_is_raised(
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("low_cap", [None, "bad"])
-async def test_unknown_battery_low_capacity_uses_safe_default(
+async def test_unknown_battery_low_capacity_blocks_bootstrap(
     mock_hass, mock_coordinator, low_cap
 ):
-    if low_cap is not None:
-        mock_coordinator.data["TEST123"]["settings"]["batteryLowCap"] = low_cap
+    mock_coordinator.data["TEST123"]["settings"]["batteryLowCap"] = low_cap
     sched = _make_scheduler(mock_hass, mock_coordinator)
     sched._now = lambda: _dt(2024, 1, 1, 12, 0)
     sched._enabled = True
-
-    await sched._async_bootstrap()
-
-    assert (
-        _slot_batch(mock_coordinator, 1)["cap1"]
-        == VirtualSlotScheduler._DEFAULT_SOC_FLOOR
-    )
+    with pytest.raises(SunsynkSettingValidationError):
+        await sched._async_bootstrap()
+    mock_coordinator.async_write_settings.assert_not_awaited()
+    mock_coordinator.async_write_setting.assert_not_awaited()

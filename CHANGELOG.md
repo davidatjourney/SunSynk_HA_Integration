@@ -3,6 +3,19 @@
 All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
+## [Unreleased]
+
+### Added
+
+- Read-only access mode, defaulting to read-only for new and existing installations. Explicitly select Read/write to allow inverter and plant settings changes. Active control and unresolved restoration block switching back to read-only.
+
+### Fixed
+
+- Require explicit master/member write profiles and live topology checks; missing metadata, role changes, cross-plant groups and unknown ratings block writes instead of falling back to a slave or guessed master.
+- Read settings fresh before writes, reject detectable external-edit conflicts, and send minimal battery/system payloads. Preserve required timer companions with validation of every transmitted value and read-back of unchanged sibling fields.
+- Enforce approved battery-current, power, export and SOC limits in the existing write pipeline, including restoration. Validate complete timer ordering and remove automatic 30 kW and unknown-SOC fallbacks.
+- Require complete profiles before selecting Read/write and prevent profile changes during active control, restoration or pending writes. Preserve local schedule editing in read-only mode.
+
 ## [2.0.0-beta.1] - 2026-10-01
 
 ### The road to 2.0 beta

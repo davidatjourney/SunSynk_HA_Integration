@@ -13,6 +13,7 @@ async_write_setting as an unbound method against a bare object carrying
 just the attributes it actually touches, matching the mocking style
 already used throughout this suite.
 """
+
 from __future__ import annotations
 
 import asyncio
@@ -28,6 +29,8 @@ from custom_components.sunsynk.api.client import (
 )
 from custom_components.sunsynk.const import DOMAIN
 from custom_components.sunsynk.coordinator import SunsynkCoordinator
+from custom_components.sunsynk.write_policy import WritePolicy
+from tests.conftest import inverter_info, safe_settings, write_profile
 from custom_components.sunsynk.write_validation import SunsynkSettingValidationError
 
 
@@ -46,38 +49,43 @@ def fake_coordinator():
 
     return SimpleNamespace(
         hass=MagicMock(),
+        write_policy=WritePolicy("read_write"),
+        write_profiles={"TEST123": write_profile()},
         _auth=auth,
         serials=["TEST123"],
         _async_get_session=AsyncMock(return_value=MagicMock()),
         async_request_refresh=AsyncMock(),
         data={
             "TEST123": {
+                "inverter": inverter_info(),
                 "settings": {
                     "sn": "TEST123",
                     "time1on": "false",
                     "cap1": "50",
                     "sellTime1Pac": "0",
                     "sellTime1": "00:00",
-                }
+                },
             }
         },
     )
 
 
-def _echoing_client(sent_payloads: list[dict]) -> MagicMock:
-    """A mock SunsynkClient whose async_get_settings echoes back the last
-    write — write verification sees exactly what was just sent, so it
-    always matches and the tests above stay focused on cache staleness
-    rather than the verification fail-safe (covered separately below).
-    """
+def _echoing_client(sent_payloads: list[dict], initial_settings=None) -> MagicMock:
+    """A patch-like cloud store: fresh reads include unchanged companion fields."""
+    state = safe_settings()
+    state.update(initial_settings or {})
     mock_client = MagicMock()
 
     async def _capture_write(session, serial, payload):
         sent_payloads.append(dict(payload))
+        state.update(payload)
 
     mock_client.async_write_settings = AsyncMock(side_effect=_capture_write)
-    mock_client.async_get_settings = AsyncMock(
-        side_effect=lambda session, serial: dict(sent_payloads[-1])
+    mock_client.async_get_settings = AsyncMock(side_effect=lambda *_: dict(state))
+    mock_client.async_get_inverter_info = AsyncMock(
+        side_effect=lambda _, serial: inverter_info(
+            serial, parallel=serial in {"MASTER1", "SLAVE1"}, master=serial != "SLAVE1"
+        )
     )
     return mock_client
 
@@ -86,7 +94,9 @@ def _echoing_client(sent_payloads: list[dict]) -> MagicMock:
 async def test_second_write_in_a_burst_sees_the_first_writes_change(fake_coordinator):
     """The exact scenario that used to revert VirtualSlotScheduler writes."""
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, fake_coordinator.data["TEST123"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
@@ -94,7 +104,9 @@ async def test_second_write_in_a_burst_sees_the_first_writes_change(fake_coordin
         await SunsynkCoordinator.async_write_setting(
             fake_coordinator, "TEST123", "time1on", 1
         )
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "cap1", 90)
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "cap1", 90
+        )
 
     assert len(sent_payloads) == 2
     # The second write's payload must carry the FIRST write's new value for
@@ -109,7 +121,9 @@ async def test_concurrent_slot_writes_are_coalesced_into_one_payload(
     fake_coordinator,
 ):
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, fake_coordinator.data["TEST123"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient",
@@ -137,8 +151,9 @@ async def test_concurrent_slot_writes_are_coalesced_into_one_payload(
         "cap1": 90,
         "sellTime1Pac": 3000,
         "sellTime1": "23:30",
+        "sellTime1on": 0,
     }
-    mock_client.async_get_settings.assert_awaited_once()
+    assert mock_client.async_get_settings.await_count >= 3
 
 
 @pytest.mark.asyncio
@@ -158,25 +173,19 @@ async def test_invalid_batch_is_rejected_before_queue_or_api(fake_coordinator):
 
 
 @pytest.mark.asyncio
-async def test_invalid_cached_sibling_cannot_hitchhike_in_payload(fake_coordinator):
+async def test_invalid_cached_sibling_is_never_transmitted(fake_coordinator):
     fake_coordinator.data["TEST123"]["settings"].update(
         {"chargeCurrent": 40, "dischargeCurrent": 1040}
     )
-    mock_client = MagicMock()
-    mock_client.async_write_settings = AsyncMock()
-
-    with (
-        patch(
-            "custom_components.sunsynk.coordinator.SunsynkClient",
-            return_value=mock_client,
-        ),
-        pytest.raises(UpdateFailed, match="Unsafe cached setting.*dischargeCurrent"),
+    sent_payloads = []
+    mock_client = _echoing_client(sent_payloads)
+    with patch(
+        "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
         await SunsynkCoordinator.async_write_setting(
             fake_coordinator, "TEST123", "chargeCurrent", 50
         )
-
-    mock_client.async_write_settings.assert_not_awaited()
+    assert sent_payloads == [{"sn": "TEST123", "chargeCurrent": 50}]
 
 
 @pytest.mark.asyncio
@@ -185,7 +194,9 @@ async def test_write_can_replace_its_own_invalid_cached_value(fake_coordinator):
         {"chargeCurrent": 40, "dischargeCurrent": 1040}
     )
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, fake_coordinator.data["TEST123"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient",
@@ -220,7 +231,7 @@ async def test_write_queue_serializes_batches_arriving_during_api_write(
     release_first = asyncio.Event()
     active_writes = 0
     max_active_writes = 0
-    server_settings = dict(fake_coordinator.data["TEST123"]["settings"])
+    server_settings = safe_settings(**fake_coordinator.data["TEST123"]["settings"])
 
     async def _write(session, serial, payload):
         nonlocal active_writes, max_active_writes
@@ -232,7 +243,7 @@ async def test_write_queue_serializes_batches_arriving_during_api_write(
         server_settings.update(payload)
         active_writes -= 1
 
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_write_settings = AsyncMock(side_effect=_write)
     mock_client.async_get_settings = AsyncMock(
         side_effect=lambda session, serial: dict(server_settings)
@@ -266,8 +277,11 @@ async def test_write_queue_serializes_batches_arriving_during_api_write(
 @pytest.mark.asyncio
 async def test_independent_inverters_can_write_in_parallel(fake_coordinator):
     fake_coordinator.serials = ["INV1", "INV2"]
+    fake_coordinator.write_profiles = {
+        serial: write_profile(serial) for serial in fake_coordinator.serials
+    }
     fake_coordinator.data = {
-        serial: {"inverter": {}, "settings": {"chargeCurrent": 40}}
+        serial: {"inverter": inverter_info(serial), "settings": {"chargeCurrent": 40}}
         for serial in fake_coordinator.serials
     }
     both_started = asyncio.Event()
@@ -284,10 +298,13 @@ async def test_independent_inverters_can_write_in_parallel(fake_coordinator):
         await release.wait()
         active -= 1
 
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_write_settings = AsyncMock(side_effect=_write)
     mock_client.async_get_settings = AsyncMock(
-        side_effect=lambda session, serial: {"chargeCurrent": 50, "sn": serial}
+        side_effect=lambda session, serial: {
+            **safe_settings(chargeCurrent=50),
+            "sn": serial,
+        }
     )
 
     with patch(
@@ -310,17 +327,17 @@ async def test_independent_inverters_can_write_in_parallel(fake_coordinator):
 
 
 @pytest.mark.asyncio
-async def test_failed_group_does_not_block_other_group_in_same_batch(
+async def test_failed_group_stops_later_group_in_same_batch(
     fake_coordinator,
 ):
-    server_settings = dict(fake_coordinator.data["TEST123"]["settings"])
+    server_settings = safe_settings(**fake_coordinator.data["TEST123"]["settings"])
 
     async def _write(session, serial, payload):
         if "time1on" in payload:
             raise SunsynkApiError("slot 1 rejected")
         server_settings.update(payload)
 
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_write_settings = AsyncMock(side_effect=_write)
     mock_client.async_get_settings = AsyncMock(
         side_effect=lambda session, serial: dict(server_settings)
@@ -339,13 +356,13 @@ async def test_failed_group_does_not_block_other_group_in_same_batch(
             {"time1on": 1, "time6on": 1},
         )
 
-    assert mock_client.async_write_settings.await_count == 2
-    assert fake_coordinator.data["TEST123"]["settings"]["time6on"] == 1
+    assert mock_client.async_write_settings.await_count == 1
+    assert not fake_coordinator.data["TEST123"]["settings"].get("time6on", 0)
 
 
 @pytest.mark.asyncio
 async def test_write_401_reaches_caller_and_invalidates_token(fake_coordinator):
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_write_settings = AsyncMock(
         side_effect=SunsynkAuthenticationError("HTTP 401")
     )
@@ -372,13 +389,14 @@ async def test_update_401_invalidates_token_and_fails_refresh():
     auth.async_get_token = AsyncMock(return_value="rejected-token")
     coordinator = SimpleNamespace(
         hass=MagicMock(),
+        write_policy=WritePolicy("read_write"),
         _auth=auth,
         _entry_id="entry-1",
         serials=["TEST123"],
         data={"TEST123": {"battery": {"soc": 50}}},
         _async_get_session=AsyncMock(return_value=MagicMock()),
     )
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_fetch_all = AsyncMock(
         side_effect=SunsynkAuthenticationError("HTTP 401")
     )
@@ -403,13 +421,14 @@ async def test_update_fails_when_every_inverter_api_call_fails():
     auth.async_get_token = AsyncMock(return_value="token")
     coordinator = SimpleNamespace(
         hass=MagicMock(),
+        write_policy=WritePolicy("read_write"),
         _auth=auth,
         _entry_id="entry-1",
         serials=["INV1", "INV2"],
         data={"INV1": {"old": True}, "INV2": {"old": True}},
         _async_get_session=AsyncMock(return_value=MagicMock()),
     )
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_fetch_all = AsyncMock(side_effect=SunsynkApiError("offline"))
 
     with (
@@ -430,6 +449,7 @@ async def test_partial_inverter_failure_does_not_expose_stale_soc():
     auth.async_get_token = AsyncMock(return_value="token")
     coordinator = SimpleNamespace(
         hass=MagicMock(),
+        write_policy=WritePolicy("read_write"),
         _auth=auth,
         _entry_id="entry-1",
         serials=["INV1", "INV2"],
@@ -439,7 +459,7 @@ async def test_partial_inverter_failure_does_not_expose_stale_soc():
         },
         _async_get_session=AsyncMock(return_value=MagicMock()),
     )
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_fetch_all = AsyncMock(
         side_effect=[
             SunsynkApiError("offline"),
@@ -468,7 +488,9 @@ async def test_coordinator_cache_updated_immediately_after_write(fake_coordinato
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "time1on", 1)
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "time1on", 1
+        )
 
     assert fake_coordinator.data["TEST123"]["settings"]["time1on"] == 1
 
@@ -483,15 +505,25 @@ async def test_full_slot_arm_sequence_does_not_revert_the_on_flag(fake_coordinat
     silently disabled despite the code explicitly turning it on.
     """
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, fake_coordinator.data["TEST123"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "time1on", 1)
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "cap1", 90)
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "sellTime1Pac", 0)
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "sellTime1", "23:30")
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "time1on", 1
+        )
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "cap1", 90
+        )
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "sellTime1Pac", 0
+        )
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "sellTime1", "23:30"
+        )
 
     # Every payload from the second one onward must carry the *current*
     # (turned-on) value, not the stale pre-burst "false".
@@ -526,12 +558,16 @@ async def test_slot_write_payload_excludes_other_slots_fields(fake_coordinator):
     fake_coordinator.data["TEST123"]["settings"]["sellTime2"] = "05:30"
     fake_coordinator.data["TEST123"]["settings"]["cap2"] = "20"
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, fake_coordinator.data["TEST123"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "time1on", 1)
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "time1on", 1
+        )
 
     assert "sellTime2" not in sent_payloads[0]
     assert "cap2" not in sent_payloads[0]
@@ -542,32 +578,38 @@ async def test_slot_write_payload_still_includes_same_slot_siblings(fake_coordin
     """The reason these are grouped at all: sellTime{n}on silently failed to
     persist when sent alone, without its own slot's other fields (#21)."""
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, fake_coordinator.data["TEST123"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "time1on", 1)
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "time1on", 1
+        )
 
     for key in ("cap1", "sellTime1Pac", "sellTime1", "time1on"):
         assert key in sent_payloads[0]
 
 
 @pytest.mark.asyncio
-async def test_global_system_mode_write_still_uses_full_group(fake_coordinator):
-    """Non-slot System Mode Timer settings (solarSell, pvMaxLimit, ...) keep
-    the original full-group write behavior — only slot-indexed fields were
-    ever implicated in the desync/corruption reports."""
+async def test_global_system_mode_write_sends_only_requested_fields(fake_coordinator):
+    """A mode edit must preserve external sibling changes without resending them."""
     fake_coordinator.data["TEST123"]["settings"]["pvMaxLimit"] = "6000"
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, fake_coordinator.data["TEST123"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "solarSell", 1)
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "solarSell", 1
+        )
 
-    assert sent_payloads[0]["pvMaxLimit"] == 6000
+    assert "pvMaxLimit" not in sent_payloads[0]
 
 
 # ── async_write_plant_price: plant_id cache-miss fallback (#20) ──────────────
@@ -585,9 +627,9 @@ async def test_write_plant_price_falls_back_to_fresh_fetch_when_cache_has_no_pla
 ):
     fake_coordinator.data["TEST123"]["plant"] = {}  # cache missed the plant lookup
 
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_get_inverter_info = AsyncMock(
-        return_value={"plant": {"id": 555}}
+        return_value=inverter_info(plant=555)
     )
     mock_client.async_get_plant_info = AsyncMock(
         return_value={
@@ -610,7 +652,9 @@ async def test_write_plant_price_falls_back_to_fresh_fetch_when_cache_has_no_pla
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_plant_price(fake_coordinator, "TEST123", 0.25)
+        await SunsynkCoordinator.async_write_plant_price(
+            fake_coordinator, "TEST123", 0.25
+        )
 
     mock_client.async_get_inverter_info.assert_awaited_once()
     mock_client.async_set_plant_income.assert_awaited_once()
@@ -628,25 +672,36 @@ async def test_write_plant_price_raises_when_fresh_fetch_also_has_no_plant(
 
     fake_coordinator.data["TEST123"]["plant"] = {}
 
-    mock_client = MagicMock()
-    mock_client.async_get_inverter_info = AsyncMock(return_value={})  # no "plant" key at all
+    mock_client = _echoing_client([])
+    mock_client.async_get_inverter_info = AsyncMock(
+        return_value={}
+    )  # no "plant" key at all
     mock_client.async_set_plant_income = AsyncMock()
 
     with (
-        patch("custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client),
-        pytest.raises(UpdateFailed, match="No plant found"),
+        patch(
+            "custom_components.sunsynk.coordinator.SunsynkClient",
+            return_value=mock_client,
+        ),
+        pytest.raises(UpdateFailed, match="Unverified write topology"),
     ):
-        await SunsynkCoordinator.async_write_plant_price(fake_coordinator, "TEST123", 0.25)
+        await SunsynkCoordinator.async_write_plant_price(
+            fake_coordinator, "TEST123", 0.25
+        )
 
     mock_client.async_set_plant_income.assert_not_awaited()
 
 
 @pytest.mark.asyncio
-async def test_write_plant_price_uses_cached_plant_id_without_refetching(fake_coordinator):
+async def test_write_plant_price_revalidates_cached_plant_id(
+    fake_coordinator,
+):
     fake_coordinator.data["TEST123"]["plant"] = {"id": 777}
 
-    mock_client = MagicMock()
-    mock_client.async_get_inverter_info = AsyncMock()
+    mock_client = _echoing_client([])
+    mock_client.async_get_inverter_info = AsyncMock(
+        return_value=inverter_info(plant=777)
+    )
     mock_client.async_get_plant_info = AsyncMock(
         return_value={
             "id": 777,
@@ -660,9 +715,11 @@ async def test_write_plant_price_uses_cached_plant_id_without_refetching(fake_co
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_plant_price(fake_coordinator, "TEST123", 0.30)
+        await SunsynkCoordinator.async_write_plant_price(
+            fake_coordinator, "TEST123", 0.30
+        )
 
-    mock_client.async_get_inverter_info.assert_not_awaited()
+    mock_client.async_get_inverter_info.assert_awaited_once()
     mock_client.async_set_plant_income.assert_awaited_once()
 
 
@@ -679,7 +736,7 @@ async def test_write_plant_price_never_replaces_non_constant_tariff(
     fake_coordinator, charges
 ):
     fake_coordinator.data["TEST123"]["plant"] = {"id": 777}
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_get_plant_info = AsyncMock(
         return_value={
             "id": 777,
@@ -727,7 +784,7 @@ async def test_write_plant_price_rejects_malformed_plant_metadata(
     fake_coordinator, plant
 ):
     fake_coordinator.data["TEST123"]["plant"] = {"id": 777}
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_get_plant_info = AsyncMock(return_value=plant)
     mock_client.async_set_plant_income = AsyncMock()
 
@@ -795,11 +852,14 @@ async def test_write_verification_clears_issue_on_match(fake_coordinator):
 
     with (
         patch(
-            "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
+            "custom_components.sunsynk.coordinator.SunsynkClient",
+            return_value=mock_client,
         ),
         patch("custom_components.sunsynk.coordinator.ir") as mock_ir,
     ):
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "time1on", 1)
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "time1on", 1
+        )
 
     mock_ir.async_create_issue.assert_not_called()
     mock_ir.async_delete_issue.assert_any_call(
@@ -811,25 +871,34 @@ async def test_write_verification_clears_issue_on_match(fake_coordinator):
 
 @pytest.mark.asyncio
 async def test_write_verification_raises_issue_on_mismatch(fake_coordinator):
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_write_settings = AsyncMock()
     # The inverter reports the write never took — still "false" after we sent 1.
     mock_client.async_get_settings = AsyncMock(
-        return_value={**fake_coordinator.data["TEST123"]["settings"], "time1on": "false"}
+        return_value=safe_settings(
+            **{**fake_coordinator.data["TEST123"]["settings"], "time1on": "false"}
+        )
     )
 
     with (
         patch(
-            "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
+            "custom_components.sunsynk.coordinator.SunsynkClient",
+            return_value=mock_client,
         ),
         patch("custom_components.sunsynk.coordinator.ir") as mock_ir,
         pytest.raises(UpdateFailed, match="rejected setting write"),
     ):
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "time1on", 1)
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "time1on", 1
+        )
 
     mock_ir.async_create_issue.assert_called_once()
     args, kwargs = mock_ir.async_create_issue.call_args
-    assert args[:3] == (fake_coordinator.hass, DOMAIN, "setting_write_mismatch_TEST123_time1on")
+    assert args[:3] == (
+        fake_coordinator.hass,
+        DOMAIN,
+        "setting_write_mismatch_TEST123_time1on",
+    )
     assert kwargs["translation_key"] == "setting_write_mismatch"
     assert kwargs["translation_placeholders"] == {
         "serial": "TEST123",
@@ -842,15 +911,16 @@ async def test_write_verification_raises_issue_on_mismatch(fake_coordinator):
 
 @pytest.mark.asyncio
 async def test_write_verification_fails_closed_on_api_error(fake_coordinator):
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_write_settings = AsyncMock()
     mock_client.async_get_settings = AsyncMock(
-        side_effect=SunsynkApiError("boom")
+        side_effect=[safe_settings(), safe_settings(), SunsynkApiError("boom")]
     )
 
     with (
         patch(
-            "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
+            "custom_components.sunsynk.coordinator.SunsynkClient",
+            return_value=mock_client,
         ),
         patch("custom_components.sunsynk.coordinator.ir") as mock_ir,
     ):
@@ -866,10 +936,14 @@ async def test_write_verification_fails_closed_on_api_error(fake_coordinator):
 
 @pytest.mark.asyncio
 async def test_write_verification_401_is_propagated(fake_coordinator):
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_write_settings = AsyncMock()
     mock_client.async_get_settings = AsyncMock(
-        side_effect=SunsynkAuthenticationError("HTTP 401")
+        side_effect=[
+            safe_settings(),
+            safe_settings(),
+            SunsynkAuthenticationError("HTTP 401"),
+        ]
     )
 
     with (
@@ -897,10 +971,17 @@ async def test_write_verification_waits_before_reading_back(fake_coordinator):
     mock_client = _echoing_client([])
 
     with (
-        patch("custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client),
-        patch("custom_components.sunsynk.coordinator.asyncio.sleep", AsyncMock()) as mock_sleep,
+        patch(
+            "custom_components.sunsynk.coordinator.SunsynkClient",
+            return_value=mock_client,
+        ),
+        patch(
+            "custom_components.sunsynk.coordinator.asyncio.sleep", AsyncMock()
+        ) as mock_sleep,
     ):
-        await SunsynkCoordinator.async_write_setting(fake_coordinator, "TEST123", "time1on", 1)
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "time1on", 1
+        )
 
     mock_sleep.assert_awaited_once()
     assert mock_sleep.call_args.args[0] == 0.25
@@ -909,11 +990,15 @@ async def test_write_verification_waits_before_reading_back(fake_coordinator):
 @pytest.mark.asyncio
 async def test_write_verification_retries_only_until_value_propagates(fake_coordinator):
     """A slow relay retries without imposing the full delay on every write."""
-    mock_client = MagicMock()
+    mock_client = _echoing_client([])
     mock_client.async_write_settings = AsyncMock()
-    stale = {**fake_coordinator.data["TEST123"]["settings"], "time1on": "false"}
+    stale = safe_settings(
+        **{**fake_coordinator.data["TEST123"]["settings"], "time1on": "false"}
+    )
     current = {**stale, "time1on": "true"}
-    mock_client.async_get_settings = AsyncMock(side_effect=[stale, current])
+    mock_client.async_get_settings = AsyncMock(
+        side_effect=[stale, stale, stale, current]
+    )
 
     with (
         patch(
@@ -929,7 +1014,7 @@ async def test_write_verification_retries_only_until_value_propagates(fake_coord
         )
 
     assert [call.args[0] for call in mock_sleep.await_args_list] == [0.25, 0.5]
-    assert mock_client.async_get_settings.await_count == 2
+    assert mock_client.async_get_settings.await_count == 4
 
 
 # ── Parallel-inverter master redirect for all settings (#21) ─────────────────
@@ -953,18 +1038,24 @@ def _parallel_coordinator() -> SimpleNamespace:
 
     return SimpleNamespace(
         hass=MagicMock(),
+        write_policy=WritePolicy("read_write"),
         _auth=auth,
         serials=["SLAVE1", "MASTER1"],
+        write_profiles={"MASTER1": write_profile("MASTER1", ["SLAVE1", "MASTER1"])},
         _async_get_session=AsyncMock(return_value=MagicMock()),
         async_request_refresh=AsyncMock(),
         data={
             "SLAVE1": {
-                "inverter": {"parallel": 1, "equipMode": 0},
+                "inverter": inverter_info("SLAVE1", parallel=True, master=False),
                 "settings": {"sn": "SLAVE1", "dischargeCurrent": 0, "time1on": "false"},
             },
             "MASTER1": {
-                "inverter": {"parallel": 1, "equipMode": 1},
-                "settings": {"sn": "MASTER1", "dischargeCurrent": 1040, "time1on": "false"},
+                "inverter": inverter_info("MASTER1", parallel=True),
+                "settings": {
+                    "sn": "MASTER1",
+                    "dischargeCurrent": 1040,
+                    "time1on": "false",
+                },
             },
         },
     )
@@ -1004,27 +1095,30 @@ class TestResolveParallelWriteTarget:
         )
         assert target == "TEST123"
 
-    def test_no_master_found_falls_back_to_original_serial(self):
-        """Defensive: if the group has no equipMode==1 unit for some reason
-        (e.g. a momentary bad poll), don't silently write nowhere useful."""
+    def test_no_master_found_blocks_write(self):
+        """A missing master must not authorize an independent slave write."""
         coordinator = _parallel_coordinator()
         coordinator.data["MASTER1"]["inverter"]["equipMode"] = 0
-        target = SunsynkCoordinator._resolve_parallel_write_target(
-            coordinator, "SLAVE1", "dischargeCurrent"
-        )
-        assert target == "SLAVE1"
+        with pytest.raises(UpdateFailed, match="topology"):
+            SunsynkCoordinator._resolve_parallel_write_target(
+                coordinator, "SLAVE1", "dischargeCurrent"
+            )
 
 
 @pytest.mark.asyncio
 async def test_write_setting_redirects_battery_key_to_parallel_master():
     coordinator = _parallel_coordinator()
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, coordinator.data["MASTER1"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_setting(coordinator, "SLAVE1", "dischargeCurrent", 27)
+        await SunsynkCoordinator.async_write_setting(
+            coordinator, "SLAVE1", "dischargeCurrent", 27
+        )
 
     # The actual API write must have targeted the master's serial, not the
     # slave's — and the master's (not the slave's) cache reflects it.
@@ -1040,12 +1134,16 @@ async def test_write_setting_redirects_time_slot_key_to_parallel_master():
     (see TestResolveParallelWriteTarget's docstring for the story)."""
     coordinator = _parallel_coordinator()
     sent_payloads: list[dict] = []
-    mock_client = _echoing_client(sent_payloads)
+    mock_client = _echoing_client(
+        sent_payloads, coordinator.data["MASTER1"]["settings"]
+    )
 
     with patch(
         "custom_components.sunsynk.coordinator.SunsynkClient", return_value=mock_client
     ):
-        await SunsynkCoordinator.async_write_setting(coordinator, "SLAVE1", "time1on", 1)
+        await SunsynkCoordinator.async_write_setting(
+            coordinator, "SLAVE1", "time1on", 1
+        )
 
     assert sent_payloads[0]["sn"] == "MASTER1"
     assert coordinator.data["MASTER1"]["settings"]["time1on"] == 1
@@ -1079,9 +1177,207 @@ class TestWriteTargetSerials:
         coordinator = _parallel_coordinator()
         assert self._get(coordinator) == ["MASTER1"]
 
-    def test_parallel_group_with_no_master_found_keeps_all_serials(self):
-        """Defensive: don't silently drop a serial with nothing left to
-        cover it (e.g. a momentary bad poll leaves equipMode unreadable)."""
+    def test_parallel_group_with_no_master_found_has_no_write_targets(self):
+        """Controllers must have no writable target when the master is missing."""
         coordinator = _parallel_coordinator()
         coordinator.data["MASTER1"]["inverter"]["equipMode"] = 0
-        assert self._get(coordinator) == ["SLAVE1", "MASTER1"]
+        assert self._get(coordinator) == []
+
+
+@pytest.mark.parametrize("member", ["SLAVE1", "MASTER1"])
+def test_missing_cached_topology_blocks_parallel_routing(member):
+    coordinator = _parallel_coordinator()
+    coordinator.data[member]["inverter"] = {}
+    with pytest.raises(UpdateFailed, match="topology"):
+        SunsynkCoordinator.resolve_write_target(coordinator, "SLAVE1")
+    assert SunsynkCoordinator.write_target_serials.fget(coordinator) == []
+
+
+def test_profiles_route_two_groups_in_the_same_plant_without_guessing():
+    coordinator = _parallel_coordinator()
+    coordinator.serials += ["MASTER2", "SLAVE2"]
+    coordinator.write_profiles["MASTER2"] = write_profile(
+        "MASTER2", ["MASTER2", "SLAVE2"]
+    )
+    coordinator.data["MASTER2"] = {"inverter": inverter_info("MASTER2", parallel=True)}
+    coordinator.data["SLAVE2"] = {
+        "inverter": inverter_info("SLAVE2", parallel=True, master=False)
+    }
+    assert SunsynkCoordinator.resolve_write_target(coordinator, "SLAVE2") == "MASTER2"
+    assert SunsynkCoordinator.write_target_serials.fget(coordinator) == [
+        "MASTER1",
+        "MASTER2",
+    ]
+
+
+@pytest.mark.parametrize(
+    "info",
+    [
+        {},
+        inverter_info("SLAVE1", parallel=True, master=True),
+        inverter_info("SLAVE1", parallel=True, master=False, plant=9),
+        inverter_info("SLAVE1", parallel=True, master=False, power=0),
+    ],
+)
+@pytest.mark.asyncio
+async def test_fresh_topology_failure_prevents_any_post(info):
+    coordinator = _parallel_coordinator()
+    sent = []
+    client = _echoing_client(sent)
+    client.async_get_inverter_info.side_effect = lambda _, serial: (
+        info if serial == "SLAVE1" else inverter_info(serial, parallel=True)
+    )
+    with patch(
+        "custom_components.sunsynk.coordinator.SunsynkClient", return_value=client
+    ):
+        with pytest.raises(UpdateFailed, match="topology"):
+            await SunsynkCoordinator.async_write_setting(
+                coordinator, "SLAVE1", "chargeCurrent", 50
+            )
+    assert sent == []
+
+
+@pytest.mark.asyncio
+async def test_role_change_after_preflight_stops_dispatch():
+    coordinator = _parallel_coordinator()
+    client = _echoing_client([])
+    client.async_get_inverter_info.side_effect = [
+        inverter_info("SLAVE1", parallel=True, master=False),
+        inverter_info("MASTER1", parallel=True),
+        inverter_info("SLAVE1", parallel=True, master=False),
+        inverter_info("MASTER1", parallel=True, master=False),
+    ]
+    with patch(
+        "custom_components.sunsynk.coordinator.SunsynkClient", return_value=client
+    ):
+        with pytest.raises(UpdateFailed, match="topology"):
+            await SunsynkCoordinator.async_write_setting(
+                coordinator, "SLAVE1", "chargeCurrent", 50
+            )
+    client.async_write_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_external_changes_are_not_overwritten(fake_coordinator):
+    client = _echoing_client([])
+    client.async_get_settings.side_effect = [
+        safe_settings(dischargeCurrent=50),
+        safe_settings(dischargeCurrent=70),
+    ]
+    with patch(
+        "custom_components.sunsynk.coordinator.SunsynkClient", return_value=client
+    ):
+        with pytest.raises(UpdateFailed, match="Settings changed"):
+            await SunsynkCoordinator.async_write_setting(
+                fake_coordinator, "TEST123", "chargeCurrent", 60
+            )
+    client.async_write_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_stale_voltage_and_protection_fields_never_reach_current_post(
+    fake_coordinator,
+):
+    fake_coordinator.data["TEST123"]["settings"].update(
+        absorptionVolt=999, bmsErrStop="bad", safetyType="bad", dischargeCurrent=100
+    )
+    sent = []
+    client = _echoing_client(
+        sent,
+        safe_settings(
+            absorptionVolt=52, bmsErrStop=True, safetyType=1, dischargeCurrent=30
+        ),
+    )
+    with patch(
+        "custom_components.sunsynk.coordinator.SunsynkClient", return_value=client
+    ):
+        await SunsynkCoordinator.async_write_setting(
+            fake_coordinator, "TEST123", "chargeCurrent", 60
+        )
+    assert sent == [{"chargeCurrent": 60, "sn": "TEST123"}]
+    assert fake_coordinator.data["TEST123"]["settings"]["dischargeCurrent"] == 30
+
+
+@pytest.mark.asyncio
+async def test_invalid_later_group_prevents_all_posts(fake_coordinator):
+    fake_coordinator.write_profiles["TEST123"] = write_profile(
+        max_power_w=8000, max_export_power_w=3000
+    )
+    client = _echoing_client([])
+    with patch(
+        "custom_components.sunsynk.coordinator.SunsynkClient", return_value=client
+    ):
+        with pytest.raises(UpdateFailed, match="power limit"):
+            await SunsynkCoordinator.async_write_settings(
+                fake_coordinator,
+                "TEST123",
+                {"chargeCurrent": 60, "solarMaxSellPower": 4000},
+            )
+    client.async_write_settings.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_readback_checks_unchanged_battery_siblings(fake_coordinator):
+    client = _echoing_client([])
+    client.async_get_settings.side_effect = [
+        safe_settings(absorptionVolt=52),
+        safe_settings(absorptionVolt=52),
+        safe_settings(chargeCurrent=60, absorptionVolt=999),
+        safe_settings(chargeCurrent=60, absorptionVolt=999),
+        safe_settings(chargeCurrent=60, absorptionVolt=999),
+    ]
+    with (
+        patch(
+            "custom_components.sunsynk.coordinator.SunsynkClient", return_value=client
+        ),
+        patch("custom_components.sunsynk.coordinator.ir"),
+    ):
+        with pytest.raises(UpdateFailed, match="absorptionVolt"):
+            await SunsynkCoordinator.async_write_setting(
+                fake_coordinator, "TEST123", "chargeCurrent", 60
+            )
+
+
+@pytest.mark.parametrize(
+    "state",
+    [
+        "missing_profile",
+        "stale_poll",
+        "wrong_serial",
+        "unexpected_response_serial",
+        "incomplete_group",
+        "missing_plant",
+    ],
+)
+def test_unverified_targets_fail_closed(fake_coordinator, state):
+    if state == "missing_profile":
+        fake_coordinator.write_profiles = {}
+    elif state == "stale_poll":
+        fake_coordinator.last_update_success = False
+    elif state == "wrong_serial":
+        with pytest.raises(UpdateFailed):
+            SunsynkCoordinator.resolve_write_target(fake_coordinator, "UNKNOWN")
+        return
+    elif state == "unexpected_response_serial":
+        fake_coordinator.data["TEST123"]["inverter"]["sn"] = "UNKNOWN"
+    elif state == "incomplete_group":
+        fake_coordinator.data["TEST123"]["inverter"]["parallel"] = True
+    else:
+        fake_coordinator.data["TEST123"]["inverter"]["plant"] = {}
+    with pytest.raises(UpdateFailed):
+        SunsynkCoordinator.resolve_write_target(fake_coordinator, "TEST123")
+
+
+@pytest.mark.asyncio
+async def test_incomplete_timer_companions_prevent_post(fake_coordinator):
+    client = _echoing_client([])
+    client.async_get_settings.return_value = {"sellTime1on": 0}
+    client.async_get_settings.side_effect = None
+    with patch(
+        "custom_components.sunsynk.coordinator.SunsynkClient", return_value=client
+    ):
+        with pytest.raises(UpdateFailed, match="complete timer slot"):
+            await SunsynkCoordinator.async_write_setting(
+                fake_coordinator, "TEST123", "sellTime1on", 0
+            )
+    client.async_write_settings.assert_not_awaited()

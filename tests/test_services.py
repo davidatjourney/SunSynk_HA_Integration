@@ -15,15 +15,17 @@ from custom_components.sunsynk import (
 )
 from custom_components.sunsynk.const import DOMAIN
 from custom_components.sunsynk.coordinator import SunsynkCoordinator
+from tests.conftest import write_profile, inverter_info
 
 
 def _coordinator() -> SunsynkCoordinator:
     coordinator = object.__new__(SunsynkCoordinator)
     coordinator.serials = ["SLAVE1", "MASTER1", "INV2"]
+    coordinator.write_profiles = {"MASTER1": write_profile("MASTER1", ["MASTER1", "SLAVE1"]), "INV2": write_profile("INV2")}
     coordinator.data = {
-        "SLAVE1": {"inverter": {"parallel": 1, "equipMode": 0}},
-        "MASTER1": {"inverter": {"parallel": 1, "equipMode": 1}},
-        "INV2": {"inverter": {}},
+        "SLAVE1": {"inverter": inverter_info("SLAVE1", parallel=True, master=False)},
+        "MASTER1": {"inverter": inverter_info("MASTER1", parallel=True)},
+        "INV2": {"inverter": inverter_info("INV2")},
     }
     return coordinator
 

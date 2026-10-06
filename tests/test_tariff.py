@@ -756,4 +756,5 @@ async def test_shutdown_attempts_every_inverter_after_restore_failure(
     mock_coordinator.async_write_settings.assert_any_await(
         "INV2", {"chargeCurrent": 50}
     )
-    assert not mgr.is_charging_active
+    assert mgr._charging_active_serials == {"INV1"}
+    assert mgr.restoration_pending

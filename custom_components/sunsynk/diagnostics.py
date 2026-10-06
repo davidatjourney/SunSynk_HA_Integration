@@ -113,6 +113,7 @@ async def async_get_config_entry_diagnostics(
         "entry_data": _redacted_data(dict(entry.data), replacements),
         "entry_options": _redacted_data(dict(entry.options), replacements),
         "coordinator": {
+            "access_mode": coordinator.write_policy.mode,
             "last_update_success": coordinator.last_update_success,
             "last_update_success_time": (
                 last_update_time.isoformat() if last_update_time else None

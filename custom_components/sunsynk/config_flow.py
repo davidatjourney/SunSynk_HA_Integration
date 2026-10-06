@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 import math
 from typing import Any
@@ -11,13 +12,22 @@ import homeassistant.helpers.config_validation as cv
 import voluptuous as vol
 from homeassistant import config_entries
 from homeassistant.const import CONF_PASSWORD, CONF_USERNAME
+from homeassistant.core import HomeAssistant
 from homeassistant.data_entry_flow import FlowResult
-from homeassistant.helpers.selector import EntitySelector, EntitySelectorConfig
+from homeassistant.helpers.selector import (
+    EntitySelector,
+    EntitySelectorConfig,
+    SelectSelector,
+    SelectSelectorConfig,
+)
 
 from .api.auth import SunsynkAuth, SunsynkAuthError
 from .const import (
+    ACCESS_READ_ONLY,
+    ACCESS_READ_WRITE,
     API_SERVER_SUNSYNK,
     API_SERVERS,
+    CONF_ACCESS_MODE,
     CONF_API_SERVER,
     CONF_CHEAP_CHARGE_CURRENT,
     CONF_CHEAP_TARGET_SOC,
@@ -39,6 +49,7 @@ from .const import (
     CONF_SERIALS,
     CONF_TARIFF_END_HOUR,
     CONF_TARIFF_START_HOUR,
+    CONF_WRITE_PROFILES,
     DEFAULT_CHEAP_TARGET_SOC,
     DEFAULT_DISCHARGE_MIN_SOC,
     DEFAULT_PERFORMANCE_RATIO,
@@ -48,12 +59,46 @@ from .const import (
     MAX_REFRESH_INTERVAL,
     MIN_REFRESH_INTERVAL,
 )
-from .write_validation import MAX_CURRENT_A
+from .write_validation import (
+    MAX_CURRENT_A,
+    SunsynkSettingValidationError,
+    parse_write_profiles,
+)
 
 _LOGGER = logging.getLogger(__name__)
 
+ACCESS_MODE_SELECTOR = SelectSelector(
+    SelectSelectorConfig(
+        options=[ACCESS_READ_ONLY, ACCESS_READ_WRITE],
+        translation_key=CONF_ACCESS_MODE,
+    )
+)
+
+
+def _prepare_read_only(hass: HomeAssistant, entry_id: str) -> bool:
+    """Revoke only after control and recovery are idle, before saving options."""
+    domain_data = hass.data.get(DOMAIN, {})
+    coordinator = domain_data.get(entry_id)
+    if coordinator is None:
+        return True
+    controllers = [
+        domain_data.get(f"{entry_id}_tariff"),
+        *domain_data.get(f"{entry_id}_vslots", {}).values(),
+    ]
+    if coordinator.writes_pending or any(
+        controller.is_enabled or controller.restoration_pending
+        for controller in controllers
+        if controller is not None
+    ):
+        return False
+    coordinator.write_policy.revoke()
+    return True
+
+
 STEP_USER_SCHEMA = vol.Schema(
     {
+        vol.Required(CONF_ACCESS_MODE, default=ACCESS_READ_ONLY): ACCESS_MODE_SELECTOR,
+        vol.Optional(CONF_WRITE_PROFILES, default="{}"): str,
         vol.Required(CONF_API_SERVER, default=API_SERVER_SUNSYNK): vol.In(
             list(API_SERVERS.values())
         ),
@@ -99,7 +144,23 @@ class SunsynkConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
             ]
             if not serials:
                 errors[CONF_SERIALS] = "invalid_serials"
-            else:
+            try:
+                profiles = parse_write_profiles(
+                    user_input.get(CONF_WRITE_PROFILES, "{}"), serials
+                )
+                if user_input.get(CONF_ACCESS_MODE) == ACCESS_READ_WRITE and set(
+                    serials
+                ) != {
+                    member
+                    for profile in profiles.values()
+                    for member in profile.members
+                }:
+                    raise SunsynkSettingValidationError(
+                        "Every writable inverter needs a profile"
+                    )
+            except SunsynkSettingValidationError:
+                errors[CONF_WRITE_PROFILES] = "invalid_write_profiles"
+            if not errors:
                 try:
                     await _async_validate_credentials(
                         user_input[CONF_API_SERVER],
@@ -121,6 +182,12 @@ class SunsynkConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
                     return self.async_create_entry(
                         title=f"Sunsynk ({', '.join(serials)})",
                         data={
+                            CONF_ACCESS_MODE: user_input.get(
+                                CONF_ACCESS_MODE, ACCESS_READ_ONLY
+                            ),
+                            CONF_WRITE_PROFILES: json.loads(
+                                user_input.get(CONF_WRITE_PROFILES, "{}") or "{}"
+                            ),
                             CONF_API_SERVER: user_input[CONF_API_SERVER],
                             CONF_USERNAME: user_input[CONF_USERNAME],
                             CONF_PASSWORD: user_input[CONF_PASSWORD],
@@ -173,6 +240,26 @@ class SunsynkOptionsFlow(config_entries.OptionsFlow):
             password = new_password or data.get(CONF_PASSWORD, "")
             if not serials:
                 errors[CONF_SERIALS] = "invalid_serials"
+            profiles_raw = user_input.get(
+                CONF_WRITE_PROFILES,
+                json.dumps(
+                    opts.get(CONF_WRITE_PROFILES, data.get(CONF_WRITE_PROFILES, {}))
+                ),
+            )
+            try:
+                profiles = parse_write_profiles(profiles_raw, serials)
+                if user_input.get(CONF_ACCESS_MODE) == ACCESS_READ_WRITE and set(
+                    serials
+                ) != {
+                    member
+                    for profile in profiles.values()
+                    for member in profile.members
+                }:
+                    raise SunsynkSettingValidationError(
+                        "Every writable inverter needs a profile"
+                    )
+            except SunsynkSettingValidationError:
+                errors[CONF_WRITE_PROFILES] = "invalid_write_profiles"
             if not username or not password:
                 errors["base"] = "invalid_auth"
             else:
@@ -259,6 +346,20 @@ class SunsynkOptionsFlow(config_entries.OptionsFlow):
                             )
                             errors["base"] = "cannot_connect"
 
+                if (
+                    not errors
+                    and (
+                        user_input.get(CONF_ACCESS_MODE, ACCESS_READ_ONLY)
+                        != ACCESS_READ_WRITE
+                        or json.loads(profiles_raw or "{}")
+                        != opts.get(
+                            CONF_WRITE_PROFILES, data.get(CONF_WRITE_PROFILES, {})
+                        )
+                    )
+                    and not _prepare_read_only(self.hass, self._config_entry.entry_id)
+                ):
+                    errors["base"] = "control_active"
+
                 if not errors:
                     if credentials_changed:
                         new_data = dict(data)
@@ -278,6 +379,10 @@ class SunsynkOptionsFlow(config_entries.OptionsFlow):
                     return self.async_create_entry(
                         title="",
                         data={
+                            CONF_ACCESS_MODE: user_input.get(
+                                CONF_ACCESS_MODE, ACCESS_READ_ONLY
+                            ),
+                            CONF_WRITE_PROFILES: json.loads(profiles_raw or "{}"),
                             CONF_REFRESH_INTERVAL: user_input[CONF_REFRESH_INTERVAL],
                             CONF_SERIALS: serials,
                             CONF_CREATE_DASHBOARD: user_input.get(
@@ -317,6 +422,16 @@ class SunsynkOptionsFlow(config_entries.OptionsFlow):
 
         schema = vol.Schema(
             {
+                vol.Required(
+                    CONF_ACCESS_MODE,
+                    default=ACCESS_READ_WRITE
+                    if _opt(CONF_ACCESS_MODE, ACCESS_READ_ONLY) == ACCESS_READ_WRITE
+                    else ACCESS_READ_ONLY,
+                ): ACCESS_MODE_SELECTOR,
+                vol.Optional(
+                    CONF_WRITE_PROFILES,
+                    default=json.dumps(_opt(CONF_WRITE_PROFILES, {})),
+                ): str,
                 vol.Required(
                     CONF_API_SERVER,
                     default=data.get(CONF_API_SERVER, API_SERVER_SUNSYNK),

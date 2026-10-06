@@ -7,6 +7,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from custom_components.sunsynk.const import DOMAIN
+from custom_components.sunsynk.write_policy import WritePolicy
 from custom_components.sunsynk.diagnostics import (
     _replace_sensitive_values,
     _safe_data,
@@ -56,6 +57,7 @@ def hass_with_entry():
     entry.options = {}
 
     coordinator = MagicMock()
+    coordinator.write_policy = WritePolicy()
     coordinator.last_update_success = True
     coordinator.last_update_success_time = datetime(2026, 1, 1, tzinfo=timezone.utc)
     coordinator.serials = ["SN1"]
@@ -86,6 +88,7 @@ class TestAsyncGetConfigEntryDiagnostics:
     async def test_includes_coordinator_status(self, hass_with_entry):
         hass, entry, _coordinator = hass_with_entry
         result = await async_get_config_entry_diagnostics(hass, entry)
+        assert result["coordinator"]["access_mode"] == "read_only"
         assert result["coordinator"]["last_update_success"] is True
         assert result["coordinator"]["last_update_success_time"] == (
             "2026-01-01T00:00:00+00:00"
@@ -172,7 +175,8 @@ class TestAsyncGetConfigEntryDiagnostics:
         # back to the default rather than auto-vivifying a MagicMock —
         # matching a real DataUpdateCoordinator on older HA versions
         # that predate this attribute.
-        coordinator = MagicMock(spec=["last_update_success", "data"])
+        coordinator = MagicMock(spec=["last_update_success", "data", "write_policy"])
+        coordinator.write_policy = WritePolicy()
         coordinator.last_update_success = True
         coordinator.data = {}
         hass.data[DOMAIN]["entry1"] = coordinator
