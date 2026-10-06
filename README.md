@@ -143,7 +143,20 @@ Automatic dashboard creation is **disabled by default**. To opt in, open
 **Settings → Devices & Services → Sunsynk → Configure**, enable **Create and
 maintain Sunsynk dashboard**, and submit. Only then will the integration
 register its bundled Power Flow Card resource and create/update its Lovelace
-dashboard. With this option disabled, the integration does not modify Lovelace.
+dashboard for each configured inverter. Each dashboard uses that inverter’s own
+entities and includes its own Charts view. With two or more configured inverters,
+the integration also creates **Solar Overview**, showing labelled power flows
+and comparison charts for all inverters. Readings stay separate: the overview
+does not add shared battery, grid or load measurements into system totals.
+Its daily generation graph uses daily changes in each inverter’s lifetime solar
+energy counter. With this option disabled, the integration does not modify
+Lovelace.
+
+Dashboards appear as **Solar <inverter alias>** in the sidebar and under
+**Settings → Dashboards**. Open the **Charts** tab (line-chart icon) for history
+and energy graphs. If no dashboard appears after enabling the option, restart
+Home Assistant fully and refresh the browser; the storage fallback registers
+dashboards on the next startup.
 
 > **Note:** The **Sunsynk Power Flow Card** (v7.3.3 by slipx06) is bundled with
 > this integration. No separate HACS installation is needed when the dashboard

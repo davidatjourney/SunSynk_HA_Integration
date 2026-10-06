@@ -204,12 +204,14 @@ async def test_dashboard_builder_resolves_registered_entity_id():
 class _DashboardCollection(dict):
     def __init__(self, fail_create=False, fail_save=False):
         super().__init__()
+        self.created_items = []
         self.fail_create = fail_create
         self.fail_save = fail_save
 
     async def async_create_item(self, item):
         if self.fail_create:
             raise RuntimeError("create failed")
+        self.created_items.append(item)
         self[item["url_path"]] = MagicMock(
             async_save=AsyncMock(
                 side_effect=RuntimeError("save failed") if self.fail_save else None
@@ -323,3 +325,244 @@ async def test_readonly_dashboard_finds_local_schedule_without_write_topology():
     ):
         await integration._async_setup_dashboard(hass, entry, coordinator)
     dashboard.async_save.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_creates_and_updates_each_inverter_independently():
+    dashboards = _DashboardCollection()
+    hass, entry, coordinator, registry = _dashboard_context(dashboards)
+    coordinator.serials = ["SN1", "SN2"]
+    coordinator.data["SN2"] = {"inverter": {"alias": "Master"}}
+    coordinator.resolve_write_target.side_effect = lambda serial: serial
+    registry.entities["sensor.master_battery_soc"] = SimpleNamespace(
+        platform=DOMAIN,
+        unique_id="SN2_battery_soc",
+        entity_id="sensor.master_battery_soc",
+    )
+
+    def build(prefix, entity_id, *_args):
+        return {"soc": entity_id("battery_soc")}
+
+    with (
+        patch("custom_components.sunsynk.er.async_get", return_value=registry),
+        patch("custom_components.sunsynk.build_dashboard", side_effect=build),
+    ):
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+        assert len(dashboards) == 3
+        assert [item["title"] for item in dashboards.created_items] == [
+            "Solar My Solar",
+            "Solar Master",
+            "Solar Overview",
+        ]
+        slave = dashboards["sunsynk-abcdef12"]
+        master_path = next(path for path in dashboards if path != "sunsynk-abcdef12")
+        master = dashboards[master_path]
+        slave.async_save.assert_awaited_once_with({"soc": "sensor.battery_soc"})
+        master.async_save.assert_awaited_once_with({"soc": "sensor.master_battery_soc"})
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+        assert len(dashboards) == 3
+        assert dashboards[master_path] is master
+        assert slave.async_save.await_count == master.async_save.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_dashboard_with_no_inverters_does_not_touch_lovelace():
+    hass, entry, coordinator, _registry = _dashboard_context(None)
+    coordinator.serials = []
+    with patch(
+        "custom_components.sunsynk._build_inverter_dashboard", new=MagicMock()
+    ) as setup:
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+    setup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_dashboard_save_failure_does_not_skip_other_inverters():
+    slave = MagicMock(async_save=AsyncMock(side_effect=RuntimeError("save failed")))
+    dashboards = _DashboardCollection()
+    dashboards["sunsynk-abcdef12"] = slave
+    hass, entry, coordinator, registry = _dashboard_context(dashboards)
+    coordinator.serials = ["SN1", "SN2"]
+    with (
+        patch("custom_components.sunsynk.er.async_get", return_value=registry),
+        patch("custom_components.sunsynk.build_dashboard", return_value={}),
+    ):
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+    assert len(dashboards) == 3
+    master = next(
+        value for path, value in dashboards.items() if path != "sunsynk-abcdef12"
+    )
+    master.async_save.assert_awaited_once_with({})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("parallel", [False, True])
+async def test_dashboards_resolve_independent_or_shared_schedules(parallel):
+    dashboards = _DashboardCollection()
+    hass, entry, coordinator, registry = _dashboard_context(dashboards)
+    coordinator.serials = ["SN1", "SN2"]
+    coordinator.resolve_write_target.side_effect = lambda serial: (
+        "SN2" if parallel else serial
+    )
+    for serial, key in [
+        ("SN2", "battery_soc"),
+        ("SN1", "vslots_state"),
+        ("SN2", "vslots_state"),
+    ]:
+        registry.entities[f"sensor.{serial}_{key}"] = SimpleNamespace(
+            platform=DOMAIN,
+            unique_id=f"{serial}_{key}",
+            entity_id=f"sensor.{serial}_{key}",
+        )
+
+    def build(_prefix, entity_id, _forecast, _tariff, _entry, schedule_id):
+        return {"soc": entity_id("battery_soc"), "schedule": schedule_id("state")}
+
+    with (
+        patch("custom_components.sunsynk.er.async_get", return_value=registry),
+        patch("custom_components.sunsynk.build_dashboard", side_effect=build),
+    ):
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+    contents = [
+        dashboard.async_save.call_args.args[0]
+        for path, dashboard in dashboards.items()
+        if not path.endswith("-overview")
+    ]
+    assert [content["soc"] for content in contents] == [
+        "sensor.battery_soc",
+        "sensor.SN2_battery_soc",
+    ]
+    assert [content["schedule"] for content in contents] == [
+        "sensor.SN2_vslots_state" if parallel else "sensor.SN1_vslots_state",
+        "sensor.SN2_vslots_state",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_multi_inverter_dashboard_storage_fallback_survives_reload():
+    hass, entry, coordinator, registry = _dashboard_context(None)
+    coordinator.serials = ["SN1", "SN2"]
+    stores = {}
+
+    def store(_hass, _version, key):
+        if key not in stores:
+            saved = {}
+
+            async def load():
+                return saved.get("data")
+
+            async def save(data):
+                saved["data"] = data
+
+            stores[key] = SimpleNamespace(
+                async_load=AsyncMock(side_effect=load),
+                async_save=AsyncMock(side_effect=save),
+            )
+        return stores[key]
+
+    with (
+        patch("custom_components.sunsynk.er.async_get", return_value=registry),
+        patch("custom_components.sunsynk.build_dashboard", return_value={}),
+        patch("homeassistant.helpers.storage.Store", side_effect=store),
+    ):
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+    items = (await stores["lovelace_dashboards"].async_load())["items"]
+    assert len(items) == 3
+    assert len({item["url_path"] for item in items}) == 3
+    assert items[0]["url_path"] == "sunsynk-abcdef12"
+    for item in items:
+        assert stores[f"lovelace.{item['url_path']}"].async_save.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_each_dashboard_charts_use_that_inverters_soc():
+    dashboards = _DashboardCollection()
+    hass, entry, coordinator, registry = _dashboard_context(dashboards)
+    coordinator.serials = ["SN1", "SN2"]
+    coordinator.resolve_write_target.side_effect = lambda serial: serial
+    registry.entities["sensor.master_soc"] = SimpleNamespace(
+        platform=DOMAIN, unique_id="SN2_battery_soc", entity_id="sensor.master_soc"
+    )
+    with patch("custom_components.sunsynk.er.async_get", return_value=registry):
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+    for dashboard, expected in zip(
+        [
+            dashboard
+            for path, dashboard in dashboards.items()
+            if not path.endswith("-overview")
+        ],
+        ["sensor.battery_soc", "sensor.master_soc"],
+        strict=True,
+    ):
+        config = dashboard.async_save.call_args.args[0]
+        charts = next(view for view in config["views"] if view["title"] == "Charts")
+        soc = next(
+            card
+            for card in charts["cards"]
+            if card["title"] == "Battery SOC — last 48 hours"
+        )
+        assert soc["entities"][0]["entity"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("count", [1, 2, 3])
+async def test_combined_dashboard_registration_and_actual_flow_mapping(count):
+    dashboards = _DashboardCollection()
+    hass, entry, coordinator, registry = _dashboard_context(dashboards)
+    coordinator.serials = [f"SN{i}" for i in range(1, count + 1)]
+    coordinator.resolve_write_target.side_effect = lambda serial: serial
+    keys = [
+        "pv_pac",
+        "battery_soc",
+        "battery_power",
+        "grid_pac",
+        "inverter_pac",
+        "load_total_power",
+        "pv_etoday",
+        "pv_etotal",
+    ]
+    for serial in coordinator.serials:
+        coordinator.data[serial] = {"inverter": {"alias": "Same alias"}}
+        for key in keys:
+            entity_id = f"sensor.{serial.lower()}_{key}"
+            registry.entities[entity_id] = SimpleNamespace(
+                platform=DOMAIN, unique_id=f"{serial}_{key}", entity_id=entity_id
+            )
+    with patch("custom_components.sunsynk.er.async_get", return_value=registry):
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+        if count == 1:
+            assert "sunsynk-abcdef12-overview" not in dashboards
+            assert len(dashboards) == 1
+            return
+        combined = dashboards["sunsynk-abcdef12-overview"]
+        config = combined.async_save.call_args.args[0]
+        assert len(dashboards) == count + 1
+        assert len(config["views"][0]["cards"]) == count
+        for stack, serial in zip(
+            config["views"][0]["cards"], coordinator.serials, strict=True
+        ):
+            assert stack["cards"][0]["content"] == f"### Same alias ({serial})"
+            assert (
+                stack["cards"][1]["entities"]["pv_total"]
+                == f"sensor.{serial.lower()}_pv_pac"
+            )
+        assert config["views"][1]["cards"][0]["entities"] == [
+            {
+                "entity": f"sensor.{serial.lower()}_pv_pac",
+                "name": f"Same alias ({serial})",
+            }
+            for serial in coordinator.serials
+        ]
+        assert (
+            next(
+                item
+                for item in dashboards.created_items
+                if item["url_path"].endswith("-overview")
+            )["title"]
+            == "Solar Overview"
+        )
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+        assert dashboards["sunsynk-abcdef12-overview"] is combined
+        assert combined.async_save.await_count == 2
+        assert len(dashboards.created_items) == count + 1

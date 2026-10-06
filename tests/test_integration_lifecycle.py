@@ -100,6 +100,8 @@ async def test_setup_and_unload_two_independent_inverters_minimal_ha():
         patch("custom_components.sunsynk.VirtualSlotScheduler", side_effect=schedulers) as scheduler_cls,
         patch("custom_components.sunsynk.Store", return_value=store),
         patch("custom_components.sunsynk._migrate_virtual_slot_entity_unique_ids") as migrate,
+        patch("custom_components.sunsynk._async_setup_dashboard", new=AsyncMock()) as dashboard,
+        patch("custom_components.sunsynk._async_enable_dashboard_frontend", new=AsyncMock()) as frontend,
     ):
         assert await async_setup_entry(hass, entry) is True
 
@@ -128,6 +130,8 @@ async def test_setup_and_unload_two_independent_inverters_minimal_ha():
     )
     tariff.start.assert_called_once()
     hass.async_create_task.assert_not_called()
+    dashboard.assert_not_called()
+    frontend.assert_not_called()
 
     assert await async_unload_entry(hass, entry) is True
     tariff.stop.assert_called_once()

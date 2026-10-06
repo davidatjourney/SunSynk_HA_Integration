@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import inspect
 import json
 import logging
@@ -55,7 +56,7 @@ from .const import (
     DOMAIN,
 )
 from .coordinator import SolarForecastCoordinator, SunsynkCoordinator
-from .dashboard import build_dashboard
+from .dashboard import _build_combined_dashboard, build_dashboard
 from .tariff import TariffChargingManager
 from .virtual_slots import (
     MAX_VIRTUAL_SLOTS,
@@ -651,19 +652,45 @@ async def _async_setup_dashboard(
     entry: ConfigEntry,
     coordinator: SunsynkCoordinator,
 ) -> None:
-    """Auto-create a Lovelace dashboard with correct entity IDs for this inverter."""
-    first_serial = coordinator.serials[0] if coordinator.serials else ""
-    inverter_data = (coordinator.data or {}).get(first_serial, {}).get("inverter", {})
-    alias = inverter_data.get("alias") or f"Sunsynk {first_serial}"
+    """Maintain individual dashboards and a multi-inverter overview."""
+    base_path = f"sunsynk-{entry.entry_id[:8].lower()}"
+    combined = []
+    for index, serial in enumerate(coordinator.serials):
+        # Preserve the existing first-inverter URL.
+        suffix = hashlib.sha256(serial.encode()).hexdigest()[:12]
+        url_path = base_path if index == 0 else f"{base_path}-{suffix}"
+        alias, entities, config = _build_inverter_dashboard(
+            hass, entry, coordinator, serial
+        )
+        await _async_save_dashboard(hass, url_path, f"Solar {alias}", config)
+        flow = config["views"][0]["cards"][0]["cards"][0] if config.get("views") else {}
+        combined.append((f"{alias} ({serial})", entities, flow))
+    if len(combined) >= 2:
+        await _async_save_dashboard(
+            hass,
+            f"{base_path}-overview",
+            "Solar Overview",
+            _build_combined_dashboard(combined),
+        )
+
+
+def _build_inverter_dashboard(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    coordinator: SunsynkCoordinator,
+    serial: str,
+) -> tuple[str, dict[str, str], dict[str, Any]]:
+    """Resolve one inverter's entities and prepare its dashboard."""
+    inverter_data = (coordinator.data or {}).get(serial, {}).get("inverter", {})
+    alias = inverter_data.get("alias") or f"Sunsynk {serial}"
     prefix = re.sub(r"[^a-z0-9]+", "_", alias.lower()).strip("_")
-    url_path = f"sunsynk-{entry.entry_id[:8].lower()}"
 
     # Look up actual entity IDs from the registry (unique_id = "{serial}_{key}")
     reg = er.async_get(hass)
     uid_map: dict[str, str] = {
-        e.unique_id[len(first_serial) + 1 :]: e.entity_id
+        e.unique_id[len(serial) + 1 :]: e.entity_id
         for e in reg.entities.values()
-        if e.platform == DOMAIN and e.unique_id.startswith(f"{first_serial}_")
+        if e.platform == DOMAIN and e.unique_id.startswith(f"{serial}_")
     }
 
     def eid(key: str) -> str | None:
@@ -688,13 +715,11 @@ async def _async_setup_dashboard(
     tariff_eid_fn = (lambda key: tariff_uid_map.get(key)) if tariff_uid_map else None
 
     try:
-        first_target = (
-            coordinator.resolve_write_target(first_serial) if first_serial else ""
-        )
+        target = coordinator.resolve_write_target(serial)
     except UpdateFailed:
         # Disabled local schedule entities exist even without a write profile.
-        first_target = first_serial
-    vslot_prefix = f"{first_target}_vslots_"
+        target = serial
+    vslot_prefix = f"{target}_vslots_"
     vslot_uid_map: dict[str, str] = {
         e.unique_id[len(vslot_prefix) :]: e.entity_id
         for e in reg.entities.values()
@@ -706,6 +731,16 @@ async def _async_setup_dashboard(
         prefix, eid, forecast_eid_fn, tariff_eid_fn, entry.entry_id, vslot_eid_fn
     )
 
+    return alias, uid_map, dashboard_config
+
+
+async def _async_save_dashboard(
+    hass: HomeAssistant,
+    url_path: str,
+    title: str,
+    dashboard_config: dict[str, Any],
+) -> None:
+    """Register or update an opt-in dashboard using HA's storage fallback."""
     lovelace = hass.data.get("lovelace")
     dashboards = getattr(lovelace, "dashboards", None)
 
@@ -729,7 +764,7 @@ async def _async_setup_dashboard(
         "url_path": url_path,
         "require_admin": False,
         "mode": "storage",
-        "title": f"Solar {alias}",
+        "title": title,
         "icon": "mdi:solar-power-variant",
         "show_in_sidebar": True,
     }

@@ -201,3 +201,105 @@ class TestStructure:
         grid_b = _cards_by_title(_views_by_title(config_b)["Diagnostics"])["Grid Details"]
         assert grid_a["entities"][0] == "sensor.prefix_a_grid_power"
         assert grid_b["entities"][0] == "sensor.prefix_b_grid_power"
+
+
+class TestCombinedDashboard:
+    def _inverter(self, serial, alias="Solar"):
+        keys = [
+            "pv_pac",
+            "battery_soc",
+            "battery_power",
+            "grid_pac",
+            "inverter_pac",
+            "load_total_power",
+            "pv_etoday",
+            "pv_etotal",
+        ]
+        entities = {key: f"sensor.{serial}_{key}" for key in keys}
+        flow = build_dashboard(serial, eid=entities.get)["views"][0]["cards"][0][
+            "cards"
+        ][0]
+        return f"{alias} ({serial})", entities, flow
+
+    def test_all_inverters_keep_separate_flows_and_chart_series(self):
+        from custom_components.sunsynk.dashboard import _build_combined_dashboard
+
+        inverters = [self._inverter(serial) for serial in ["master", "slave", "third"]]
+        config = _build_combined_dashboard(inverters)
+        assert [view["title"] for view in config["views"]] == ["Overview", "Charts"]
+        for stack, (label, entities, original) in zip(
+            config["views"][0]["cards"], inverters, strict=True
+        ):
+            assert label in stack["cards"][0]["content"]
+            flow = stack["cards"][1]
+            assert flow["entities"]["battery_soc_184"] == entities["battery_soc"]
+            assert all(
+                value in entities.values() or value == "none"
+                for value in flow["entities"].values()
+            )
+            assert flow is not original
+            assert (
+                original["entities"]["battery_temp_182"]
+                == f"sensor.{label.split('(')[1][:-1]}_battery_temperature"
+            )
+            assert [row["entity"] for row in stack["cards"][2]["entities"]] == [
+                entities[key]
+                for key in ["battery_soc", "pv_pac", "load_total_power", "pv_etoday"]
+            ]
+        graphs = config["views"][1]["cards"]
+        for graph, key in zip(
+            graphs,
+            [
+                "pv_pac",
+                "battery_power",
+                "grid_pac",
+                "load_total_power",
+                "battery_soc",
+                "pv_etotal",
+            ],
+            strict=True,
+        ):
+            assert graph["entities"] == [
+                {"entity": entities[key], "name": label}
+                for label, entities, _flow in inverters
+            ]
+        assert [graph["hours_to_show"] for graph in graphs[:5]] == [24, 24, 24, 24, 48]
+        assert graphs[5]["stat_types"] == ["change"]
+        assert graphs[5]["period"] == "day"
+        assert graphs[5]["days_to_show"] == 30
+
+    def test_missing_entities_are_omitted_without_guessed_ids(self):
+        from custom_components.sunsynk.dashboard import _build_combined_dashboard
+
+        config = _build_combined_dashboard(
+            [
+                ("Missing (SN1)", {}, {}),
+                ("Partial (SN2)", {"battery_soc": "sensor.registered_soc"}, {}),
+            ]
+        )
+        missing, partial = config["views"][0]["cards"]
+        assert all(card["type"] == "markdown" for card in missing["cards"])
+        assert "required sensor" in partial["cards"][1]["content"]
+        assert partial["cards"][2]["entities"] == [
+            {"entity": "sensor.registered_soc", "name": "Battery SOC"}
+        ]
+        graphs = config["views"][1]["cards"]
+        assert all(graph["type"] == "markdown" for graph in graphs[:4] + graphs[5:])
+        assert graphs[4]["entities"] == [
+            {"entity": "sensor.registered_soc", "name": "Partial (SN2)"}
+        ]
+
+    def test_unavailable_entity_state_does_not_become_zero(self):
+        from custom_components.sunsynk.dashboard import _build_combined_dashboard
+
+        label, entities, flow = self._inverter("offline")
+        config = _build_combined_dashboard([(label, entities, flow)])
+        graph = config["views"][1]["cards"][0]
+        # The config refers to the real entity; HA retains its unavailable
+        # state/history. There are no template defaults or numeric substitutes.
+        assert graph["entities"] == [{"entity": "sensor.offline_pv_pac", "name": label}]
+        assert "template" not in str(config)
+        assert (
+            config["views"][0]["cards"][0]["cards"][1]["entities"]["pv_total"]
+            == "sensor.offline_pv_pac"
+        )

@@ -7,10 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
+- Opt-in Solar Overview dashboard for multi-inverter installations, with individually labelled power flows, live readings and comparison graphs. Preserve individual dashboards and keep shared readings separate instead of adding system totals.
 - Read-only access mode, defaulting to read-only for new and existing installations. Explicitly select Read/write to allow inverter and plant settings changes. Active control and unresolved restoration block switching back to read-only.
 
 ### Fixed
 
+- Create an opt-in solar dashboard for every configured inverter instead of only the first serial. Each dashboard resolves its own sensor and schedule entities and includes its own Charts view; retain the existing first-inverter dashboard URL.
 - Require administrator access for all five custom control/schedule services using Home Assistant's existing permission helper; keep system automations supported and prevent slave serials from bypassing the check.
 - Keep optional dashboard schedule entities available in read-only setups without a write profile.
 - Require explicit master/member write profiles and live topology checks; missing metadata, role changes, cross-plant groups and unknown ratings block writes instead of falling back to a slave or guessed master.

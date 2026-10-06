@@ -889,3 +889,119 @@ def build_dashboard(
             },
         ]
     }
+
+
+def _build_combined_dashboard(
+    inverters: list[tuple[str, dict[str, str], dict[str, Any]]],
+) -> dict[str, Any]:
+    """Compare registered inverter readings without summing shared measurements."""
+    from copy import deepcopy
+
+    overview = []
+    required_flow = {
+        "pv_pac",
+        "battery_soc",
+        "battery_power",
+        "grid_pac",
+        "inverter_pac",
+    }
+    for label, entities, prepared_flow in inverters:
+        cards: list[dict[str, Any]] = [{"type": "markdown", "content": f"### {label}"}]
+        if prepared_flow and required_flow <= entities.keys():
+            flow = deepcopy(prepared_flow)
+            registered = set(entities.values())
+            flow["entities"] = {
+                key: value
+                for key, value in flow["entities"].items()
+                if value in registered or value == "none"
+            }
+            cards.append(flow)
+        else:
+            cards.append(
+                {
+                    "type": "markdown",
+                    "content": "Power flow is unavailable because required sensor entities are missing.",
+                }
+            )
+        summary = [
+            {"entity": entities[key], "name": name}
+            for key, name in [
+                ("battery_soc", "Battery SOC"),
+                ("pv_pac", "Solar power"),
+                ("load_total_power", "Load power"),
+                ("pv_etoday", "Solar generation today"),
+            ]
+            if key in entities
+        ]
+        if summary:
+            cards.append(
+                {"type": "entities", "entities": summary, "show_header_toggle": False}
+            )
+        else:
+            cards.append(
+                {
+                    "type": "markdown",
+                    "content": "No sensor readings are available for this inverter.",
+                }
+            )
+        overview.append({"type": "vertical-stack", "cards": cards})
+
+    charts = []
+    for key, title, hours in [
+        ("pv_pac", "Solar power — last 24 hours", 24),
+        ("battery_power", "Battery power — last 24 hours", 24),
+        ("grid_pac", "Grid power — last 24 hours", 24),
+        ("load_total_power", "Load power — last 24 hours", 24),
+        ("battery_soc", "Battery SOC — last 48 hours", 48),
+        ("pv_etotal", "Daily solar generation — last 30 days", 0),
+    ]:
+        series = [
+            {"entity": entities[key], "name": label}
+            for label, entities, _flow in inverters
+            if key in entities
+        ]
+        if not series:
+            charts.append(
+                {
+                    "type": "markdown",
+                    "content": f"**{title}**\n\nNo sensor readings are available for this graph.",
+                }
+            )
+        elif hours:
+            charts.append(
+                {
+                    "type": "history-graph",
+                    "title": title,
+                    "hours_to_show": hours,
+                    "entities": series,
+                }
+            )
+        else:
+            charts.append(
+                {
+                    "type": "statistics-graph",
+                    "title": title,
+                    "entities": series,
+                    "stat_types": ["change"],
+                    "days_to_show": 30,
+                    "chart_type": "bar",
+                    "period": "day",
+                }
+            )
+    return {
+        "title": "Solar Overview",
+        "views": [
+            {
+                "title": "Overview",
+                "path": "overview",
+                "icon": "mdi:solar-power-variant",
+                "cards": overview,
+            },
+            {
+                "title": "Charts",
+                "path": "charts",
+                "icon": "mdi:chart-line",
+                "cards": charts,
+            },
+        ],
+    }
