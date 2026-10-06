@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -28,6 +29,7 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.update_coordinator import CoordinatorEntity
 from homeassistant.util import dt as dt_util
 
+from .combined import combined_prefix, shared_master
 from .const import (
     ALL_STATIC_SENSORS,
     DOMAIN,
@@ -130,6 +132,20 @@ async def async_setup_entry(
             )
         entities.append(InverterInternalPowerSensor(coordinator, serial, device_info))
         entities.append(PlantEnergyPriceSensor(coordinator, serial, device_info))
+
+    if len(coordinator.serials) >= 2:
+        prefix = combined_prefix(entry.entry_id, coordinator.serials)
+        device = DeviceInfo(
+            identifiers={(DOMAIN, prefix)},
+            name="Combined Solar System",
+            manufacturer="Sunsynk / Deye",
+            model="Parallel installation",
+        )
+        entities.extend(
+            CombinedSystemSensor(coordinator, prefix, description, device)
+            for description in ALL_STATIC_SENSORS
+            if description.key in COMBINED_SUM_KEYS | COMBINED_MASTER_KEYS
+        )
 
     async_add_entities(entities)
 
@@ -411,6 +427,77 @@ class SunsynkSensor(CoordinatorEntity[SunsynkCoordinator], SensorEntity):
             if self.entity_description.state_class is not None:
                 return None
             return str(value) if value != "" else None
+
+
+COMBINED_SUM_KEYS = {
+    "pv_pac",
+    "pv_etoday",
+    "pv_etotal",
+    "battery_power",
+    "battery_current",
+    "battery_etoday_charge",
+    "battery_etoday_discharge",
+    "battery_etotal_charge",
+    "battery_etotal_discharge",
+    "grid_pac",
+    "grid_etoday_from",
+    "grid_etoday_to",
+    "grid_etotal_from",
+    "grid_etotal_to",
+    "load_total_power",
+    "load_daily_used",
+    "load_total_used",
+    "inverter_pac",
+    "inverter_rate_power",
+}
+COMBINED_MASTER_KEYS = {
+    "battery_soc",
+    "battery_voltage",
+    "battery_temp",
+    "battery_capacity",
+    "grid_fac",
+}
+
+
+class CombinedSystemSensor(CoordinatorEntity[SunsynkCoordinator], SensorEntity):
+    """Sum inverter measurements; take shared battery readings once."""
+
+    _attr_has_entity_name = True
+
+    def __init__(self, coordinator, prefix, description, device_info):
+        super().__init__(coordinator)
+        self.entity_description = description
+        self._attr_unique_id = f"{prefix}{description.key}"
+        self._attr_device_info = device_info
+
+    @property
+    def native_value(self) -> float | None:
+        data = self.coordinator.data or {}
+        master = shared_master(self.coordinator.serials, data)
+        if master is None:
+            return None
+        description = self.entity_description
+        members = (
+            self.coordinator.serials
+            if description.key in COMBINED_SUM_KEYS
+            else [master]
+        )
+        values = []
+        for serial in members:
+            endpoint = data.get(serial, {}).get(description.endpoint, {})
+            raw = _resolve_value(endpoint, description.data_key)
+            if isinstance(raw, bool):
+                return None
+            try:
+                value = float(raw)
+            except (TypeError, ValueError):
+                return None
+            if not math.isfinite(value) or (
+                description.key == "battery_temp" and value == -100
+            ):
+                return None
+            values.append(value)
+        return round(sum(values), 3)
 
 
 class InverterInternalPowerSensor(CoordinatorEntity[SunsynkCoordinator], SensorEntity):

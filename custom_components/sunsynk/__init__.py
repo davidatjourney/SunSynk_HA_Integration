@@ -22,6 +22,7 @@ from homeassistant.helpers.update_coordinator import UpdateFailed
 
 from .api.auth import SunsynkAuth
 from .calibration import PerformanceRatioCalibrator
+from .combined import combined_prefix, shared_master
 from .const import (
     ACCESS_READ_ONLY,
     ACCESS_READ_WRITE,
@@ -667,11 +668,19 @@ async def _async_setup_dashboard(
         flow = config["views"][0]["cards"][0]["cards"][0] if config.get("views") else {}
         combined.append((f"{alias} ({serial})", entities, flow))
     if len(combined) >= 2:
+        prefix = combined_prefix(entry.entry_id, coordinator.serials)
+        system_entities = {
+            entity.unique_id[len(prefix) :]: entity.entity_id
+            for entity in er.async_get(hass).entities.values()
+            if entity.platform == DOMAIN and entity.unique_id.startswith(prefix)
+        }
+        if shared_master(coordinator.serials, coordinator.data or {}) is None:
+            system_entities = {}
         await _async_save_dashboard(
             hass,
             f"{base_path}-overview",
             "Solar Overview",
-            _build_combined_dashboard(combined),
+            _build_combined_dashboard(combined, system_entities),
         )
 
 

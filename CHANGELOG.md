@@ -7,10 +7,12 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/).
 
 ### Added
 
-- Opt-in Solar Overview dashboard for multi-inverter installations, with individually labelled power flows, live readings and comparison graphs. Preserve individual dashboards and keep shared readings separate instead of adding system totals.
+- Opt-in Solar Overview dashboard for multi-inverter installations, with one combined installation power-flow diagram, derived system sensors and comparison graphs. Sum per-inverter power and energy while reading shared battery SOC, voltage, temperature and capacity once from the verified master. Require one live parallel group in one plant and return unknown for incomplete readings. Preserve individual dashboards and separate statistics when membership changes.
 - Read-only access mode, defaulting to read-only for new and existing installations. Explicitly select Read/write to allow inverter and plant settings changes. Active control and unresolved restoration block switching back to read-only.
 
 ### Fixed
+
+- Restore the battery gauge, Solar PV, Battery, Grid and Today’s Energy panels beneath the single combined diagram, using combined system sensors and the same full-width layout and diagram scale as individual dashboards.
 
 - Initialize the bundled Power Flow Card registry when the frontend has not created it yet, preventing the browser’s undefined `push` error. Refresh the resource URL so clients fetch the patched bundle.
 

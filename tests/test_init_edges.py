@@ -538,15 +538,13 @@ async def test_combined_dashboard_registration_and_actual_flow_mapping(count):
         combined = dashboards["sunsynk-abcdef12-overview"]
         config = combined.async_save.call_args.args[0]
         assert len(dashboards) == count + 1
-        assert len(config["views"][0]["cards"]) == count
-        for stack, serial in zip(
-            config["views"][0]["cards"], coordinator.serials, strict=True
-        ):
-            assert stack["cards"][0]["content"] == f"### Same alias ({serial})"
-            assert (
-                stack["cards"][1]["entities"]["pv_total"]
-                == f"sensor.{serial.lower()}_pv_pac"
-            )
+        assert (
+            "Same alias (SN1)" in config["views"][0]["cards"][0]["cards"][0]["content"]
+        )
+        assert all(
+            card["type"] == "markdown"
+            for card in config["views"][0]["cards"][0]["cards"]
+        )
         assert config["views"][1]["cards"][0]["entities"] == [
             {
                 "entity": f"sensor.{serial.lower()}_pv_pac",
@@ -566,3 +564,42 @@ async def test_combined_dashboard_registration_and_actual_flow_mapping(count):
         assert dashboards["sunsynk-abcdef12-overview"] is combined
         assert combined.async_save.await_count == 2
         assert len(dashboards.created_items) == count + 1
+
+
+@pytest.mark.asyncio
+async def test_verified_parallel_group_uses_one_combined_diagram_with_registered_totals():
+    from custom_components.sunsynk.combined import combined_prefix
+
+    dashboards = _DashboardCollection()
+    hass, entry, coordinator, registry = _dashboard_context(dashboards)
+    coordinator.serials = ["SN1", "SN2"]
+    prefix = combined_prefix(entry.entry_id, coordinator.serials)
+    for serial, role in [("SN1", "0"), ("SN2", "1")]:
+        coordinator.data[serial] = {
+            "inverter": {"alias": serial, "plant": {"id": 123}},
+            "settings": {"parallel": "1", "equipMode": role},
+        }
+    for key in [
+        "pv_pac",
+        "battery_soc",
+        "battery_power",
+        "grid_pac",
+        "inverter_pac",
+        "load_total_power",
+    ]:
+        entity_id = f"sensor.combined_{key}"
+        registry.entities[entity_id] = SimpleNamespace(
+            platform=DOMAIN, unique_id=f"{prefix}{key}", entity_id=entity_id
+        )
+    with patch("custom_components.sunsynk.er.async_get", return_value=registry):
+        await integration._async_setup_dashboard(hass, entry, coordinator)
+    config = dashboards["sunsynk-abcdef12-overview"].async_save.call_args.args[0]
+    flows = [
+        card
+        for card in config["views"][0]["cards"][0]["cards"]
+        if card["type"] == "custom:sunsynk-power-flow-card"
+    ]
+    assert len(flows) == 1
+    assert flows[0]["entities"]["battery_power_190"] == "sensor.combined_battery_power"
+    assert flows[0]["entities"]["essential_power"] == "sensor.combined_load_total_power"
+    assert len(dashboards) == 3

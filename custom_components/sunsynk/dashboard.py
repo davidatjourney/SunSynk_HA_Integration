@@ -893,11 +893,14 @@ def build_dashboard(
 
 def _build_combined_dashboard(
     inverters: list[tuple[str, dict[str, str], dict[str, Any]]],
+    system_entities: dict[str, str] | None = None,
 ) -> dict[str, Any]:
-    """Compare registered inverter readings without summing shared measurements."""
-    from copy import deepcopy
-
-    overview = []
+    """Show one installation diagram with combined monitoring sensors."""
+    entities = system_entities or {}
+    labels = ", ".join(label for label, _entities, _flow in inverters)
+    overview: list[dict[str, Any]] = [
+        {"type": "markdown", "content": f"### Combined Solar System\n\n{labels}"}
+    ]
     required_flow = {
         "pv_pac",
         "battery_soc",
@@ -905,46 +908,42 @@ def _build_combined_dashboard(
         "grid_pac",
         "inverter_pac",
     }
-    for label, entities, prepared_flow in inverters:
-        cards: list[dict[str, Any]] = [{"type": "markdown", "content": f"### {label}"}]
-        if prepared_flow and required_flow <= entities.keys():
-            flow = deepcopy(prepared_flow)
-            registered = set(entities.values())
-            flow["entities"] = {
-                key: value
-                for key, value in flow["entities"].items()
-                if value in registered or value == "none"
-            }
-            cards.append(flow)
-        else:
-            cards.append(
-                {
-                    "type": "markdown",
-                    "content": "Power flow is unavailable because required sensor entities are missing.",
-                }
-            )
-        summary = [
-            {"entity": entities[key], "name": name}
-            for key, name in [
-                ("battery_soc", "Battery SOC"),
-                ("pv_pac", "Solar power"),
-                ("load_total_power", "Load power"),
-                ("pv_etoday", "Solar generation today"),
-            ]
-            if key in entities
+    if required_flow <= entities.keys():
+        prepared = build_dashboard("combined", eid=entities.get)["views"][0]["cards"][
+            0
+        ]["cards"]
+        flow = prepared[0]
+        registered = set(entities.values())
+        flow["entities"] = {
+            key: value
+            for key, value in flow["entities"].items()
+            if value in registered or value == "none"
+        }
+        if "load_total_power" in entities:
+            flow["entities"]["essential_power"] = entities["load_total_power"]
+        flow["solar"]["mppts"] = 1
+        overview.append(flow)
+        # Reuse the individual layout with system entity IDs, filtering any
+        # optional readings absent from the registry instead of guessing IDs.
+        summaries = prepared[1]
+        for card in summaries["cards"]:
+            if card["type"] == "entities":
+                card["entities"] = [
+                    row for row in card["entities"] if row["entity"] in registered
+                ]
+        overview.append(summaries)
+        energy = prepared[2]
+        energy["entities"] = [
+            row for row in energy["entities"] if row["entity"] in registered
         ]
-        if summary:
-            cards.append(
-                {"type": "entities", "entities": summary, "show_header_toggle": False}
-            )
-        else:
-            cards.append(
-                {
-                    "type": "markdown",
-                    "content": "No sensor readings are available for this inverter.",
-                }
-            )
-        overview.append({"type": "vertical-stack", "cards": cards})
+        overview.append(energy)
+    else:
+        overview.append(
+            {
+                "type": "markdown",
+                "content": "Combined flow is unavailable until all inverter readings identify one parallel installation with one master, and combined sensor entities are registered.",
+            }
+        )
 
     charts = []
     for key, title, hours in [
@@ -957,7 +956,10 @@ def _build_combined_dashboard(
     ]:
         series = [
             {"entity": entities[key], "name": label}
-            for label, entities, _flow in inverters
+            for label, entities, _flow in [
+                *inverters,
+                ("Combined system", entities, {}),
+            ]
             if key in entities
         ]
         if not series:
@@ -995,7 +997,8 @@ def _build_combined_dashboard(
                 "title": "Overview",
                 "path": "overview",
                 "icon": "mdi:solar-power-variant",
-                "cards": overview,
+                "type": "panel",
+                "cards": [{"type": "vertical-stack", "cards": overview}],
             },
             {
                 "title": "Charts",

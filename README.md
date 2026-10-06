@@ -145,9 +145,21 @@ maintain Sunsynk dashboard**, and submit. Only then will the integration
 register its bundled Power Flow Card resource and create/update its Lovelace
 dashboard for each configured inverter. Each dashboard uses that inverter’s own
 entities and includes its own Charts view. With two or more configured inverters,
-the integration also creates **Solar Overview**, showing labelled power flows
-and comparison charts for all inverters. Readings stay separate: the overview
-does not add shared battery, grid or load measurements into system totals.
+the integration also creates **Solar Overview**. For one parallel installation
+with one master in one plant, its Overview shows **one combined power-flow
+diagram** labelled with all member inverters. Monitoring sensors sum per-inverter
+solar, battery, grid, load and output power and energy counters. Shared battery
+SOC, voltage, temperature and capacity come from the master once. The Charts
+tab compares individual readings with the combined system readings. The
+combined Overview includes the battery gauge, Solar PV, Battery, Grid and
+Today’s Energy panels below the diagram.
+
+Combined readings require fresh metadata identifying every configured member
+as part of that single parallel installation. Missing readings or ambiguous
+topology make totals unknown rather than treating missing members as zero.
+Independent installations remain accessible through their individual dashboards.
+Changing the member list creates separate combined statistics identities; the
+new system history starts when Home Assistant records those new entities.
 Its daily generation graph uses daily changes in each inverter’s lifetime solar
 energy counter. With this option disabled, the integration does not modify
 Lovelace.
