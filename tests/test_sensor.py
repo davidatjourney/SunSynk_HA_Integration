@@ -8,8 +8,52 @@ into that port and the sensor would otherwise sit permanently unavailable.
 from __future__ import annotations
 
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
-from custom_components.sunsynk.sensor import _build_dynamic_descriptions
+import pytest
+
+from custom_components.sunsynk.const import BATTERY_SENSORS
+from custom_components.sunsynk.sensor import SunsynkSensor, _build_dynamic_descriptions
+
+
+@pytest.mark.parametrize(
+    ("battery", "expected"),
+    [
+        # Slave/master BMS measurements from the supplied diagnostics.
+        ({"soc": "43.0", "bmsSoc": 0.0, "bmsVolt": 0.0, "bmsTemp": -100.0}, None),
+        ({"soc": "65.0", "bmsSoc": 65.0, "bmsVolt": 47.09}, 65.0),
+        # A genuine empty battery remains a valid reading.
+        ({"soc": "0.0", "bmsSoc": "0.0", "bmsVolt": "48.0"}, 0.0),
+        ({"bmsSoc": "64.0"}, 64.0),
+        ({"bmsSoc": 64, "bmsVolt": None}, None),
+        ({"bmsSoc": 64, "bmsVolt": "--"}, None),
+        ({"bmsSoc": 64, "bmsVolt": -1}, None),
+        ({"bmsSoc": 64, "bmsVolt": "nan"}, None),
+        ({"bmsSoc": 64, "bmsVolt": "inf"}, None),
+        ({"bmsSoc": "--", "bmsVolt": 48}, None),
+        ({"bmsSoc": None, "bmsVolt": 48}, None),
+        ({"bmsSoc": "nan", "bmsVolt": 48}, None),
+        ({"bmsSoc": "inf", "bmsVolt": 48}, None),
+        ({"bmsSoc": -1, "bmsVolt": 48}, None),
+        ({"bmsSoc": 101, "bmsVolt": 48}, None),
+        ({"bmsSoc": 100, "bmsVolt": 48}, 100.0),
+        ({"soc": 64}, None),
+    ],
+)
+def test_bms_soc_rejects_missing_telemetry_without_changing_regular_soc(battery, expected):
+    coordinator = MagicMock()
+    coordinator.data = {"TEST123": {"battery": battery}}
+    sensors = {
+        description.key: SunsynkSensor(coordinator, "TEST123", description, {})
+        for description in BATTERY_SENSORS
+        if description.key in {"battery_soc", "battery_bms_soc"}
+    }
+
+    assert sensors["battery_bms_soc"].native_value == expected
+    regular_soc = battery.get("soc")
+    assert sensors["battery_soc"].native_value == (
+        float(regular_soc) if regular_soc is not None else None
+    )
 
 
 def _coordinator(flow: dict | None = None) -> SimpleNamespace:
