@@ -894,12 +894,17 @@ def build_dashboard(
 def _build_combined_dashboard(
     inverters: list[tuple[str, dict[str, str], dict[str, Any]]],
     system_entities: dict[str, str] | None = None,
+    battery_bank_capacity_kwh: float | None = None,
 ) -> dict[str, Any]:
     """Show one installation diagram with combined monitoring sensors."""
     entities = system_entities or {}
     labels = ", ".join(label for label, _entities, _flow in inverters)
     overview: list[dict[str, Any]] = [
-        {"type": "markdown", "content": f"### Combined Solar System\n\n{labels}"}
+        {
+            "type": "markdown",
+            "content": f"### Combined Solar System\n\n{labels}",
+            "grid_options": {"columns": "full", "rows": "auto"},
+        }
     ]
     required_flow = {
         "pv_pac",
@@ -922,21 +927,20 @@ def _build_combined_dashboard(
         if "load_total_power" in entities:
             flow["entities"]["essential_power"] = entities["load_total_power"]
         flow["solar"]["mppts"] = 1
+        # The bundled card validates daily entity IDs when these flags are on.
+        flow["solar"]["show_daily"] = "pv_etoday" in entities
+        flow["battery"]["show_daily"] = {
+            "battery_etoday_charge",
+            "battery_etoday_discharge",
+        } <= entities.keys()
+        flow["grid"]["show_daily_buy"] = "grid_etoday_from" in entities
+        flow["grid"]["show_daily_sell"] = "grid_etoday_to" in entities
+        flow["load"]["show_daily"] = "load_daily_used" in entities
         overview.append(flow)
-        # Reuse the individual layout with system entity IDs, filtering any
-        # optional readings absent from the registry instead of guessing IDs.
-        summaries = prepared[1]
-        for card in summaries["cards"]:
-            if card["type"] == "entities":
-                card["entities"] = [
-                    row for row in card["entities"] if row["entity"] in registered
-                ]
-        overview.append(summaries)
-        energy = prepared[2]
-        energy["entities"] = [
-            row for row in energy["entities"] if row["entity"] in registered
-        ]
-        overview.append(energy)
+        flow["card_width"] = "100%"
+        # An explicit SVG height keeps the battery section inside the card.
+        flow["card_height"] = "400"
+        flow["grid_options"] = {"columns": "full", "rows": "auto"}
     else:
         overview.append(
             {
@@ -990,6 +994,83 @@ def _build_combined_dashboard(
                     "period": "day",
                 }
             )
+    chart = {
+        "type": "custom:sunsynk-overview-chart",
+        "entities": {
+            key: entities[key]
+            for key in ("pv_pac", "load_total_power", "battery_soc")
+            if key in entities
+        },
+        "battery_bank_capacity_kwh": battery_bank_capacity_kwh,
+        "grid_options": {"columns": "full", "rows": "auto"},
+    }
+    detail_views = []
+    for title, icon, readings in [
+        (
+            "Solar",
+            "mdi:solar-power",
+            [
+                ("pv_pac", "Power now"),
+                ("pv_etoday", "Generation today"),
+                ("pv_etotal", "Generation total"),
+            ],
+        ),
+        (
+            "Battery",
+            "mdi:battery",
+            [
+                ("battery_soc", "SOC"),
+                ("battery_power", "Power"),
+                ("battery_voltage", "Voltage"),
+                ("battery_current", "Current"),
+                ("battery_temp", "Temperature"),
+                ("battery_capacity", "Capacity (Ah)"),
+                ("battery_etoday_charge", "Charged today"),
+                ("battery_etoday_discharge", "Discharged today"),
+                ("battery_etotal_charge", "Charged total"),
+                ("battery_etotal_discharge", "Discharged total"),
+            ],
+        ),
+        (
+            "Grid",
+            "mdi:transmission-tower",
+            [
+                ("grid_pac", "Power"),
+                ("grid_fac", "Frequency"),
+                ("grid_etoday_from", "Import today"),
+                ("grid_etoday_to", "Export today"),
+                ("grid_etotal_from", "Import total"),
+                ("grid_etotal_to", "Export total"),
+            ],
+        ),
+    ]:
+        rows = [
+            {"entity": entities[key], "name": name}
+            for key, name in readings
+            if key in entities
+        ]
+        detail_views.append(
+            {
+                "title": title,
+                "path": title.lower(),
+                "icon": icon,
+                "cards": [
+                    {
+                        "type": "entities",
+                        "title": title,
+                        "show_header_toggle": False,
+                        "entities": rows,
+                    }
+                ]
+                if rows
+                else [
+                    {
+                        "type": "markdown",
+                        "content": f"Combined {title.lower()} readings are unavailable.",
+                    }
+                ],
+            }
+        )
     return {
         "title": "Solar Overview",
         "views": [
@@ -997,9 +1078,14 @@ def _build_combined_dashboard(
                 "title": "Overview",
                 "path": "overview",
                 "icon": "mdi:solar-power-variant",
-                "type": "panel",
-                "cards": [{"type": "vertical-stack", "cards": overview}],
+                "type": "sections",
+                "max_columns": 2,
+                "sections": [
+                    {"type": "grid", "cards": overview},
+                    {"type": "grid", "cards": [chart]},
+                ],
             },
+            *detail_views,
             {
                 "title": "Charts",
                 "path": "charts",

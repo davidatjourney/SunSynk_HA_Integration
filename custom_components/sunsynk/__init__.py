@@ -28,6 +28,7 @@ from .const import (
     ACCESS_READ_WRITE,
     CONF_ACCESS_MODE,
     CONF_API_SERVER,
+    CONF_BATTERY_BANK_CAPACITY_KWH,
     CONF_CHEAP_CHARGE_CURRENT,
     CONF_CHEAP_TARGET_SOC,
     CONF_CHEAP_THRESHOLD,
@@ -138,6 +139,8 @@ CONFIG_SCHEMA = cv.config_entry_only_config_schema(DOMAIN)
 
 _CARD_JS = "sunsynk-power-flow-card.js"
 _CARD_URL = f"/sunsynk/{_CARD_JS}"
+_CHART_JS = "sunsynk-overview-chart.js"
+_CHART_URL = f"/sunsynk/{_CHART_JS}"
 
 
 def _read_manifest_version() -> str:
@@ -156,6 +159,7 @@ def _read_manifest_version() -> str:
 _MANIFEST_VERSION = _read_manifest_version()
 # Increment the bundled-card revision when patching JS without a release bump.
 _CARD_RESOURCE_URL = f"{_CARD_URL}?v={_MANIFEST_VERSION}&card=1"
+_CHART_RESOURCE_URL = f"{_CHART_URL}?v={_MANIFEST_VERSION}&chart=1"
 
 
 async def _maybe_await(value: Any) -> Any:
@@ -165,7 +169,9 @@ async def _maybe_await(value: Any) -> Any:
     return value
 
 
-async def _async_register_lovelace_resource(hass: HomeAssistant) -> None:
+async def _async_register_lovelace_resource(
+    hass: HomeAssistant, resource_url: str = _CARD_RESOURCE_URL
+) -> None:
     """Register the bundled card as a Lovelace module resource."""
     lovelace = hass.data.get("lovelace")
     resources = getattr(lovelace, "resources", None)
@@ -186,14 +192,15 @@ async def _async_register_lovelace_resource(hass: HomeAssistant) -> None:
         existing = [
             item
             for item in items
-            if str(item.get("url", "")).split("?", 1)[0] == _CARD_URL
+            if str(item.get("url", "")).split("?", 1)[0]
+            == resource_url.split("?", 1)[0]
         ]
 
         if existing:
             item = existing[0]
             updates: dict[str, str] = {}
-            if item.get("url") != _CARD_RESOURCE_URL:
-                updates["url"] = _CARD_RESOURCE_URL
+            if item.get("url") != resource_url:
+                updates["url"] = resource_url
             if item.get("type") != "module":
                 updates["res_type"] = "module"
             if updates and item.get("id") and hasattr(resources, "async_update_item"):
@@ -205,14 +212,14 @@ async def _async_register_lovelace_resource(hass: HomeAssistant) -> None:
             await resources.async_create_item(
                 {
                     "res_type": "module",
-                    "url": _CARD_RESOURCE_URL,
+                    "url": resource_url,
                 }
             )
             _LOGGER.debug("Sunsynk Power Flow Card Lovelace resource registered")
         else:
             _LOGGER.debug(
                 "Sunsynk: Lovelace resources are read-only; add %s manually",
-                _CARD_RESOURCE_URL,
+                resource_url,
             )
     except Exception as err:  # noqa: BLE001
         _LOGGER.warning(
@@ -287,11 +294,21 @@ async def async_setup(hass: HomeAssistant, config: dict) -> bool:
         from homeassistant.components.http import StaticPathConfig  # HA 2024.7+
 
         await hass.http.async_register_static_paths(
-            [StaticPathConfig(_CARD_URL, card_path, False)]
+            [
+                StaticPathConfig(_CARD_URL, card_path, False),
+                StaticPathConfig(
+                    _CHART_URL, str(Path(__file__).parent / "www" / _CHART_JS), False
+                ),
+            ]
         )
     except (ImportError, AttributeError):
         try:
             hass.http.register_static_path(_CARD_URL, card_path, cache_headers=False)
+            hass.http.register_static_path(
+                _CHART_URL,
+                str(Path(__file__).parent / "www" / _CHART_JS),
+                cache_headers=False,
+            )
         except Exception as err:  # noqa: BLE001
             # The card is optional; services must still be registered.
             _LOGGER.warning("Could not serve card static file: %s", err)
@@ -586,9 +603,11 @@ async def _async_enable_dashboard_frontend(hass: HomeAssistant) -> None:
         from homeassistant.components.frontend import add_extra_js_url
 
         add_extra_js_url(hass, _CARD_RESOURCE_URL)
+        add_extra_js_url(hass, _CHART_RESOURCE_URL)
     except Exception as err:  # noqa: BLE001
         _LOGGER.debug("Could not register extra frontend JS module: %s", err)
     await _async_register_lovelace_resource(hass)
+    await _async_register_lovelace_resource(hass, _CHART_RESOURCE_URL)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
@@ -680,7 +699,11 @@ async def _async_setup_dashboard(
             hass,
             f"{base_path}-overview",
             "Solar Overview",
-            _build_combined_dashboard(combined, system_entities),
+            _build_combined_dashboard(
+                combined,
+                system_entities,
+                entry.options.get(CONF_BATTERY_BANK_CAPACITY_KWH),
+            ),
         )
 
 

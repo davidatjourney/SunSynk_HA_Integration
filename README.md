@@ -151,8 +151,22 @@ diagram** labelled with all member inverters. Monitoring sensors sum per-inverte
 solar, battery, grid, load and output power and energy counters. Shared battery
 SOC, voltage, temperature and capacity come from the master once. The Charts
 tab compares individual readings with the combined system readings. The
-combined Overview includes the battery gauge, Solar PV, Battery, Grid and
-Today’s Energy panels below the diagram.
+combined Overview uses a responsive two-column layout: the power-flow diagram
+and one rolling 24-hour graph sit side by side on desktop and stack on phones.
+Detailed readings are available in the **Solar**, **Battery** and **Grid** tabs.
+The responsive combined Overview requires Sections views (Home Assistant 2024.3
+or later).
+The bundled overview graph shows solar and load on a **kW** axis and estimated
+stored battery energy on a separate **kWh** axis, with touch, mouse and keyboard
+inspection. No additional HACS card is required.
+
+To enable the battery energy line, open **Sunsynk → Configure** and enter
+**Total battery-bank capacity (kWh)** for the entire shared bank, counted once.
+Stored energy is estimated as capacity × SOC / 100, without reserve or efficiency
+deductions. Clearing this optional setting hides that line. Changing capacity
+recalculates the displayed SOC history; it does not create a new energy sensor.
+History requires Home Assistant Recorder data for the combined entities; missing
+readings remain gaps rather than becoming zero.
 
 Combined readings require fresh metadata identifying every configured member
 as part of that single parallel installation. Missing readings or ambiguous

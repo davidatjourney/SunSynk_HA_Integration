@@ -34,6 +34,7 @@ CONF_API_SERVER: Final = "api_server"
 CONF_SERIALS: Final = "serials"
 CONF_REFRESH_INTERVAL: Final = "refresh_interval"
 CONF_CREATE_DASHBOARD: Final = "create_dashboard"
+CONF_BATTERY_BANK_CAPACITY_KWH: Final = "battery_bank_capacity_kwh"
 
 API_SERVER_SUNSYNK: Final = "api.sunsynk.net"
 API_SERVER_INTELESS: Final = "pv.inteless.com"

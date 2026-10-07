@@ -29,6 +29,7 @@ from .const import (
     API_SERVERS,
     CONF_ACCESS_MODE,
     CONF_API_SERVER,
+    CONF_BATTERY_BANK_CAPACITY_KWH,
     CONF_CHEAP_CHARGE_CURRENT,
     CONF_CHEAP_TARGET_SOC,
     CONF_CHEAP_THRESHOLD,
@@ -240,6 +241,23 @@ class SunsynkOptionsFlow(config_entries.OptionsFlow):
             password = new_password or data.get(CONF_PASSWORD, "")
             if not serials:
                 errors[CONF_SERIALS] = "invalid_serials"
+            capacity_fields: dict[str, float] = {}
+            capacity_raw = user_input.get(
+                CONF_BATTERY_BANK_CAPACITY_KWH,
+                opts.get(CONF_BATTERY_BANK_CAPACITY_KWH, ""),
+            )
+            if str(capacity_raw).strip():
+                try:
+                    capacity = float(capacity_raw)
+                    if (
+                        isinstance(capacity_raw, bool)
+                        or not math.isfinite(capacity)
+                        or capacity <= 0
+                    ):
+                        raise ValueError
+                    capacity_fields[CONF_BATTERY_BANK_CAPACITY_KWH] = capacity
+                except (TypeError, ValueError):
+                    errors[CONF_BATTERY_BANK_CAPACITY_KWH] = "invalid_battery_capacity"
             profiles_raw = user_input.get(
                 CONF_WRITE_PROFILES,
                 json.dumps(
@@ -388,6 +406,7 @@ class SunsynkOptionsFlow(config_entries.OptionsFlow):
                             CONF_CREATE_DASHBOARD: user_input.get(
                                 CONF_CREATE_DASHBOARD, False
                             ),
+                            **capacity_fields,
                             **forecast_fields,
                             **tariff_fields,
                         },
@@ -450,6 +469,10 @@ class SunsynkOptionsFlow(config_entries.OptionsFlow):
                     CONF_CREATE_DASHBOARD,
                     default=bool(_opt(CONF_CREATE_DASHBOARD, False)),
                 ): cv.boolean,
+                vol.Optional(
+                    CONF_BATTERY_BANK_CAPACITY_KWH,
+                    default=_opt_str(CONF_BATTERY_BANK_CAPACITY_KWH),
+                ): str,
                 # Solar Forecast
                 vol.Optional(
                     CONF_LATITUDE, default=str(current_lat) if current_lat != "" else ""

@@ -387,3 +387,30 @@ async def test_write_enabled_options_require_valid_complete_profiles(profile):
         _user_input(password="", access_mode="read_write", write_profiles=profile)
     )
     assert result["errors"]["write_profiles"] == "invalid_write_profiles"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", ["0", "-1", "nan", "inf", "bad", True])
+async def test_battery_bank_capacity_rejects_invalid_values(value):
+    flow = _options_flow()
+    result = await flow.async_step_init(
+        _user_input(password="", battery_bank_capacity_kwh=value)
+    )
+    assert result["errors"]["battery_bank_capacity_kwh"] == "invalid_battery_capacity"
+
+
+@pytest.mark.asyncio
+async def test_battery_bank_capacity_save_preserve_and_clear():
+    flow = _options_flow()
+    result = await flow.async_step_init(
+        _user_input(password="", battery_bank_capacity_kwh="20")
+    )
+    assert result["type"] == "create_entry"
+    assert result["data"]["battery_bank_capacity_kwh"] == 20
+    flow._config_entry.options = result["data"]
+    result = await flow.async_step_init(_user_input(password=""))
+    assert result["data"]["battery_bank_capacity_kwh"] == 20
+    result = await flow.async_step_init(
+        _user_input(password="", battery_bank_capacity_kwh="")
+    )
+    assert "battery_bank_capacity_kwh" not in result["data"]

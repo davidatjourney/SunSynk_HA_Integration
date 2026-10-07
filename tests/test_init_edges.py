@@ -85,7 +85,8 @@ async def test_setup_static_path_legacy_api_success():
     hass = MagicMock()
     hass.http.async_register_static_paths = AsyncMock(side_effect=AttributeError)
     assert await integration.async_setup(hass, {}) is True
-    hass.http.register_static_path.assert_called_once()
+    assert hass.http.register_static_path.call_count == 2
+    assert hass.http.register_static_path.call_args_list[1].args[0] == integration._CHART_URL
     assert hass.services.async_register.call_count == 5
 
 
@@ -136,8 +137,9 @@ async def test_dashboard_frontend_success_and_failure(mock_hass):
         ) as register,
     ):
         await integration._async_enable_dashboard_frontend(mock_hass)
-    add_extra.assert_called_once()
-    register.assert_awaited_once()
+    assert add_extra.call_count == 2
+    assert add_extra.call_args_list[1].args[1] == integration._CHART_RESOURCE_URL
+    assert register.await_count == 2
 
     with (
         patch(
@@ -149,7 +151,7 @@ async def test_dashboard_frontend_success_and_failure(mock_hass):
         ) as register,
     ):
         await integration._async_enable_dashboard_frontend(mock_hass)
-    register.assert_awaited_once()
+    assert register.await_count == 2
 
 
 def _dashboard_context(dashboards):
@@ -539,13 +541,13 @@ async def test_combined_dashboard_registration_and_actual_flow_mapping(count):
         config = combined.async_save.call_args.args[0]
         assert len(dashboards) == count + 1
         assert (
-            "Same alias (SN1)" in config["views"][0]["cards"][0]["cards"][0]["content"]
+            "Same alias (SN1)" in config["views"][0]["sections"][0]["cards"][0]["content"]
         )
         assert all(
             card["type"] == "markdown"
-            for card in config["views"][0]["cards"][0]["cards"]
+            for card in config["views"][0]["sections"][0]["cards"]
         )
-        assert config["views"][1]["cards"][0]["entities"] == [
+        assert config["views"][-1]["cards"][0]["entities"] == [
             {
                 "entity": f"sensor.{serial.lower()}_pv_pac",
                 "name": f"Same alias ({serial})",
@@ -574,6 +576,7 @@ async def test_verified_parallel_group_uses_one_combined_diagram_with_registered
     hass, entry, coordinator, registry = _dashboard_context(dashboards)
     coordinator.serials = ["SN1", "SN2"]
     prefix = combined_prefix(entry.entry_id, coordinator.serials)
+    entry.options = {"battery_bank_capacity_kwh": 20}
     for serial, role in [("SN1", "0"), ("SN2", "1")]:
         coordinator.data[serial] = {
             "inverter": {"alias": serial, "plant": {"id": 123}},
@@ -596,10 +599,27 @@ async def test_verified_parallel_group_uses_one_combined_diagram_with_registered
     config = dashboards["sunsynk-abcdef12-overview"].async_save.call_args.args[0]
     flows = [
         card
-        for card in config["views"][0]["cards"][0]["cards"]
+        for card in config["views"][0]["sections"][0]["cards"]
         if card["type"] == "custom:sunsynk-power-flow-card"
     ]
     assert len(flows) == 1
+    assert config["views"][0]["sections"][1]["cards"][0]["battery_bank_capacity_kwh"] == 20
     assert flows[0]["entities"]["battery_power_190"] == "sensor.combined_battery_power"
     assert flows[0]["entities"]["essential_power"] == "sensor.combined_load_total_power"
     assert len(dashboards) == 3
+
+
+@pytest.mark.asyncio
+async def test_chart_resource_is_registered_separately_and_idempotently():
+    resources = MagicMock(loaded=True)
+    items = [{"id": "flow", "url": integration._CARD_RESOURCE_URL, "type": "module"}]
+    resources.async_items = lambda: items
+    resources.async_create_item = AsyncMock()
+    resources.async_update_item = AsyncMock()
+    hass = SimpleNamespace(data={"lovelace": SimpleNamespace(resources=resources)})
+    await integration._async_register_lovelace_resource(hass, integration._CHART_RESOURCE_URL)
+    resources.async_create_item.assert_awaited_once_with({"res_type": "module", "url": integration._CHART_RESOURCE_URL})
+    items.append({"id": "chart", "url": integration._CHART_RESOURCE_URL, "type": "module"})
+    await integration._async_register_lovelace_resource(hass, integration._CHART_RESOURCE_URL)
+    resources.async_create_item.assert_awaited_once()
+    resources.async_update_item.assert_not_awaited()
