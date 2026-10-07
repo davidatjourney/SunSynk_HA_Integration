@@ -927,6 +927,8 @@ def _build_combined_dashboard(
         if "load_total_power" in entities:
             flow["entities"]["essential_power"] = entities["load_total_power"]
         flow["solar"]["mppts"] = 1
+        flow["battery"]["power_only"] = True
+        flow["battery"]["show_remaining_energy"] = False
         # The bundled card validates daily entity IDs when these flags are on.
         flow["solar"]["show_daily"] = "pv_etoday" in entities
         flow["battery"]["show_daily"] = {

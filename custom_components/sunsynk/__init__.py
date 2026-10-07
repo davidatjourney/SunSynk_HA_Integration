@@ -158,7 +158,7 @@ def _read_manifest_version() -> str:
 
 _MANIFEST_VERSION = _read_manifest_version()
 # Increment the bundled-card revision when patching JS without a release bump.
-_CARD_RESOURCE_URL = f"{_CARD_URL}?v={_MANIFEST_VERSION}&card=1"
+_CARD_RESOURCE_URL = f"{_CARD_URL}?v={_MANIFEST_VERSION}&card=2"
 _CHART_RESOURCE_URL = f"{_CHART_URL}?v={_MANIFEST_VERSION}&chart=1"
 
 

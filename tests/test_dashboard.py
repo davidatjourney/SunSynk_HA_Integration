@@ -273,6 +273,14 @@ class TestCombinedDashboard:
         assert all(label in heading["content"] for label, _, _ in inverters)
         assert flow["type"] == "custom:sunsynk-power-flow-card"
         assert flow["card_width"] == "100%"
+        assert flow["battery"]["power_only"] is True
+        assert flow["battery"]["show_remaining_energy"] is False
+        assert (
+            "power_only"
+            not in build_dashboard("individual")["views"][0]["cards"][0]["cards"][0][
+                "battery"
+            ]
+        )
         assert flow["entities"]["essential_power"] == system["load_total_power"]
         assert flow["entities"]["pv_total"] == system["pv_pac"]
         assert flow["solar"]["mppts"] == 1
